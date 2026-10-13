@@ -1,0 +1,61 @@
+# gpubench 配置：一次评测的全部参数都在这里。
+# 运行：bash run_pipeline.sh            （默认读取本文件）
+#       bash run_pipeline.sh my.yaml    （使用别的配置文件）
+# 相对路径都相对于仓库根目录（run_pipeline.sh 所在目录）。
+
+paths:
+  data_dir: data/jsonl              # 完整（未下采样）jsonl 所在目录
+  out_dir: auto                     # auto = results/<时间戳>；也可写成固定路径，支持 {timestamp} 占位符
+
+# ---------------------------------------------------------------------------
+# 下采样规则（第 1 步）。每个 source 独立、确定性地执行：
+#   rng = numpy.random.default_rng([seed, crc32(name)])
+#   1. 丢掉 num_tokens < min_tokens 或 num_tokens > max_input_tokens 的行
+#   2. num_tokens < short_len 的行以 short_keep 的概率保留（按文件顺序，每行一个随机数）
+#   3. 从剩下的行中不放回均匀抽 num_samples 行（不够则全取）
+# 同样的 jsonl + 同样的规则 => 逐字节相同的 sampled.jsonl（manifest 里有指纹可核对）
+# ---------------------------------------------------------------------------
+sampling:
+  seed: 20261013
+  tokenizer: Qwen/Qwen3-8B-FP8      # 统计长度用的 tokenizer（与 runtime.model 一致）
+  max_input_tokens: 131000          # 必须 < runtime.context_length
+  length_buckets: [0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]   # 报告里的长度分段
+  sources:
+    - name: wildchat
+      file: wildchat.jsonl
+      num_samples: 90000
+      min_tokens: 0
+      short_len: 512                # 短于 512 token 的 query ...
+      short_keep: 0.1               # ... 只保留 10%
+    - name: swe_rebench
+      file: swe_rebench.jsonl
+      num_samples: 10000
+      min_tokens: 0
+      short_len: 0                  # 不做短 query 下采样
+      short_keep: 1.0
+
+# ---------------------------------------------------------------------------
+# 纯 prefill 测试（第 3 步）：SGLang 官方 sglang.benchmark.one_batch，
+# 每次 ModelRunner.extend() 前后 device synchronize 计时；无 server / HTTP / 调度 / chunked prefill。
+# ---------------------------------------------------------------------------
+runtime:
+  python: python3                   # 装有 sglang==0.5.21 的 python，例如 /opt/venv/bin/python
+  sglang_version: "0.5.21"          # 固定版本，不一致时报错退出
+  allow_version_mismatch: false     # true = 只告警（结果与其他版本不可比，不建议）
+  model: Qwen/Qwen3-8B-FP8          # 模型路径或 HF id
+  gpus: [0]                         # 使用的 GPU；按 tp 分组，每组独立处理一个数据分片（数据并行）
+  tp: [1]                           # tensor parallel；写多个值 = 依次扫参，如 [1, 2]
+  attention_backend: [default]      # 写多个值 = 扫参，如 [default, flashinfer, triton]；default = SGLang 自动选择
+  mem_fraction_static: 0.7          # KV 池显存占比；其余留给单次 128k prefill 的激活值（OOM 调小，KV 不够调大）
+  context_length: 131072            # 必须 > sampling.max_input_tokens
+  yarn: auto                        # auto = context_length > 40960 时开启 Qwen3 YaRN(factor 4)；也可 true / false
+  batch_tokens: 0                   # 0 = 每条请求单独一次 prefill；>0 = 把相邻请求拼进一次 extend()，直到该 token 数
+  max_requests: 0                   # 每个分片最多跑多少条（调试用），0 = 全部
+  extra_server_args: ""             # 其他 SGLang 参数，如 "--fp8-gemm-backend cutlass"
+  peak_tflops: 0                    # 单卡 dense 峰值 TFLOPS，用于计算 MFU；0 = 不计算
+  monitor_interval: 0.5             # nvidia-smi 采样间隔（秒）
+  base_port: 31000                  # 各分片的 NCCL 端口基数（分片 i 使用 base_port + 100*i）
+
+pipeline:
+  confirm: true                     # 第 2 步展示统计后，需要输入 y 才开始测试；false = 直接开始
+  stats_only: false                 # true = 只做第 1、2 步（下采样 + 可视化）

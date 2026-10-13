@@ -1,0 +1,9 @@
+# data is distributed separately (see README); only the manifests are tracked
+data/*
+!data/jsonl/
+data/jsonl/*
+!data/jsonl/*.manifest.json
+results/
+logs/
+__pycache__/
+*.pyc
