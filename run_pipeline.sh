@@ -6,7 +6,8 @@
 #   bash run_pipeline.sh my.yaml --stats-only   # override pipeline.stats_only: steps 1-2 only
 #   bash run_pipeline.sh my.yaml --yes          # override pipeline.confirm: no prompt before step 3
 #
-#   [1/3] downsample   full per-source jsonl --(sampling rule, fixed seed)--> sampled.jsonl
+#   [1/3] data         raw parquet (see data/README.md) --(convert, count tokens, seeded downsampling)-->
+#                      data/processed/<source>.jsonl, one per source (cached: skipped when unchanged)
 #   [2/3] visualize    token + turn distribution, printed and saved; tester confirms
 #   [3/3] prefill      tokenize -> SGLang official one_batch (ModelRunner.extend; no server / HTTP /
 #                      scheduler / chunking) over every sampled request -> report.md
@@ -20,7 +21,7 @@ for a in "$@"; do
   case "$a" in
     --stats-only) FORCE_STATS_ONLY=1;;
     --yes|-y) FORCE_YES=1;;
-    -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     -*) echo "unknown option: $a" >&2; exit 1;;
     *) CONFIG_FILE="$a";;
   esac
@@ -46,11 +47,10 @@ eval "$vars"
 log "config: $CONFIG_FILE"
 
 # ---------------- checks ----------------
-[[ -d "$DATA_DIR" ]] || die "paths.data_dir not found: $DATA_DIR"
 command -v "$PYTHON" >/dev/null || die "runtime.python not found: $PYTHON"
 missing=$("$PYTHON" -c "
 import importlib.util
-print(' '.join(m for m in ['numpy', 'matplotlib', 'transformers'] if importlib.util.find_spec(m) is None))")
+print(' '.join(m for m in ['numpy', 'pyarrow', 'matplotlib', 'transformers'] if importlib.util.find_spec(m) is None))")
 [[ -z "$missing" ]] || die "missing python packages for $PYTHON: $missing"
 if [[ "$STATS_ONLY" != 1 ]]; then
   "$PYTHON" -c "import sglang" 2>/dev/null || die "sglang not importable by $PYTHON (pip install sglang==$SGLANG_VERSION)"
@@ -74,13 +74,19 @@ SAMPLING_JSON="$OUT_DIR/sampling_config.json"
 "$BOOT_PYTHON" "$ROOT/scripts/load_config.py" "$CONFIG_FILE" --root "$ROOT" --emit sampling-json --out "$SAMPLING_JSON"
 log "results -> $OUT_DIR"
 
-# ---------------- [1/3] downsample ----------------
-step "[1/3] 下采样 (seed 固定)"
-"$PYTHON" "$ROOT/scripts/downsample.py" --config "$SAMPLING_JSON" --data-dir "$DATA_DIR" --out-dir "$OUT_DIR/dataset"
+# ---------------- [1/3] data processing + downsampling ----------------
+step "[1/3] 数据处理 + 下采样 (seed 固定) -> $PROCESSED_DIR"
+"$PYTHON" "$ROOT/scripts/prepare_data.py" --config "$SAMPLING_JSON" --out-dir "$PROCESSED_DIR" --workers "$WORKERS"
+cp "$PROCESSED_DIR/manifest.json" "$OUT_DIR/dataset/sample_manifest.json"
+cp "$PROCESSED_DIR/sample_index.csv" "$OUT_DIR/dataset/sample_index.csv"
+IFS=',' read -ra SRC_NAMES <<< "$SOURCE_NAMES"
+SAMPLED_FILES=()
+for n in "${SRC_NAMES[@]}"; do SAMPLED_FILES+=("$PROCESSED_DIR/$n.jsonl"); done
+log "outputs: ${SAMPLED_FILES[*]}"
 
 # ---------------- [2/3] visualize ----------------
 step "[2/3] 数据分布 (左: token 分布, 右: 轮次分布)"
-"$PYTHON" "$ROOT/scripts/visualize.py" --sample-dir "$OUT_DIR/dataset" --config "$SAMPLING_JSON"
+"$PYTHON" "$ROOT/scripts/visualize.py" --sample-dir "$PROCESSED_DIR" --out-dir "$OUT_DIR/dataset" --config "$SAMPLING_JSON"
 
 if [[ "$STATS_ONLY" == 1 ]]; then
   log "stats only: done. figure: $OUT_DIR/dataset/sample_distribution.png"
@@ -105,7 +111,7 @@ step "[3/3] Prefill 测试 (SGLang one_batch: ModelRunner.extend)"
 } > "$OUT_DIR/env.txt"
 
 log "tokenizing the sampled set ..."
-"$PYTHON" "$ROOT/scripts/make_prompts.py" --sampled "$OUT_DIR/dataset/sampled.jsonl" --config "$SAMPLING_JSON" \
+"$PYTHON" "$ROOT/scripts/make_prompts.py" --sampled "${SAMPLED_FILES[@]}" --config "$SAMPLING_JSON" \
   --tokenizer "$MODEL" --out-dir "$OUT_DIR/dataset"
 
 MONITOR_PID=""

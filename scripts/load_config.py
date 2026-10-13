@@ -24,6 +24,7 @@ RUNTIME_DEFAULTS = {
 }
 PIPELINE_DEFAULTS = {"confirm": True, "stats_only": False}
 SOURCE_DEFAULTS = {"min_tokens": 0, "short_len": 0, "short_keep": 1.0}
+FORMATS = ("wildchat", "swe_rebench")
 
 
 def fail(msg):
@@ -45,9 +46,11 @@ def load(path, root):
             fail(f"missing sampling.{k}")
     names = set()
     for i, s in enumerate(samp["sources"]):
-        for k in ("name", "file", "num_samples"):
+        for k in ("name", "format", "input", "num_samples"):
             if k not in s:
                 fail(f"missing sampling.sources[{i}].{k}")
+        if s["format"] not in FORMATS:
+            fail(f"sampling.sources[{i}].format must be one of {FORMATS}")
         if s["name"] in names:
             fail(f"duplicate source name: {s['name']}")
         names.add(s["name"])
@@ -72,10 +75,14 @@ def load(path, root):
     def resolve(p):
         return p if os.path.isabs(p) else os.path.normpath(os.path.join(root, p))
 
+    for s in samp["sources"]:
+        s["input"] = resolve(str(s["input"]))
+
     out = str(paths.get("out_dir", "auto"))
     ts = time.strftime("%Y%m%d_%H%M%S")
     out = os.path.join("results", ts) if out == "auto" else out.replace("{timestamp}", ts)
-    return cfg, samp, rt, pl, resolve(str(paths.get("data_dir", "data/jsonl"))), resolve(out)
+    workers = int((cfg.get("processing") or {}).get("workers", 0))
+    return cfg, samp, rt, pl, resolve(str(paths.get("processed_dir", "data/processed"))), resolve(out), workers
 
 
 def main():
@@ -85,7 +92,7 @@ def main():
     ap.add_argument("--emit", choices=["shell", "sampling-json"], required=True)
     ap.add_argument("--out", help="output file for --emit sampling-json")
     args = ap.parse_args()
-    cfg, samp, rt, pl, data_dir, out_dir = load(args.config, args.root)
+    cfg, samp, rt, pl, processed_dir, out_dir, workers = load(args.config, args.root)
 
     if args.emit == "sampling-json":
         with open(args.out, "w") as f:
@@ -96,7 +103,8 @@ def main():
     if yarn not in ("auto", "true", "false", "1", "0"):
         fail("runtime.yarn must be auto / true / false")
     shell = {
-        "DATA_DIR": data_dir, "OUT_DIR": out_dir, "PYTHON": rt["python"], "MODEL": rt["model"],
+        "PROCESSED_DIR": processed_dir, "OUT_DIR": out_dir, "WORKERS": workers,
+        "SOURCE_NAMES": ",".join(s["name"] for s in samp["sources"]), "PYTHON": rt["python"], "MODEL": rt["model"],
         "SGLANG_VERSION": str(rt["sglang_version"]), "ALLOW_VERSION_MISMATCH": int(bool(rt["allow_version_mismatch"])),
         "GPUS": ",".join(str(g) for g in as_list(rt["gpus"])), "TP_LIST": ",".join(str(t) for t in as_list(rt["tp"])),
         "ATTENTION_BACKEND_LIST": ",".join(str(a) for a in as_list(rt["attention_backend"])),

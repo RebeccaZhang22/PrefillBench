@@ -1,8 +1,6 @@
-# data is distributed separately (see README); only the manifests are tracked
+# raw and processed data are not tracked (download: data/README.md)
 data/*
-!data/jsonl/
-data/jsonl/*
-!data/jsonl/*.manifest.json
+!data/README.md
 results/
 logs/
 __pycache__/

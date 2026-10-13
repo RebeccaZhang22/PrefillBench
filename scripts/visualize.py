@@ -21,7 +21,8 @@ COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3"]
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--sample-dir", required=True, help="output dir of downsample.py")
+    p.add_argument("--sample-dir", required=True, help="output dir of prepare_data.py (holds sample_index.csv)")
+    p.add_argument("--out-dir", default="", help="where to write the figure / stats (default: --sample-dir)")
     p.add_argument("--config", required=True)
     return p.parse_args()
 
@@ -113,11 +114,13 @@ def main():
     ax2.legend(fontsize=8)
     ax2.grid(alpha=0.3)
     fig.tight_layout()
-    fig_path = os.path.join(args.sample_dir, "sample_distribution.png")
+    out_dir = args.out_dir or args.sample_dir
+    os.makedirs(out_dir, exist_ok=True)
+    fig_path = os.path.join(out_dir, "sample_distribution.png")
     fig.savefig(fig_path, dpi=130)
     print(f" figure: {fig_path}")
 
-    with open(os.path.join(args.sample_dir, "sample_stats.json"), "w") as f:
+    with open(os.path.join(out_dir, "sample_stats.json"), "w") as f:
         json.dump({"sources": rows, "length_buckets": buckets}, f, indent=2)
 
 

@@ -4,16 +4,22 @@
 # 相对路径都相对于仓库根目录（run_pipeline.sh 所在目录）。
 
 paths:
-  data_dir: data/jsonl              # 完整（未下采样）jsonl 所在目录
-  out_dir: auto                     # auto = results/<时间戳>；也可写成固定路径，支持 {timestamp} 占位符
+  processed_dir: data/processed     # 第 1 步的输出：下采样后的 <source>.jsonl（每个 source 一个）
+  out_dir: auto                     # 可视化 / 测试结果；auto = results/<时间戳>，也可写固定路径，支持 {timestamp}
+
+processing:
+  workers: 0                        # 第 1 步统计 token 数的进程数；0 = 全部 CPU
 
 # ---------------------------------------------------------------------------
-# 下采样规则（第 1 步）。每个 source 独立、确定性地执行：
-#   rng = numpy.random.default_rng([seed, crc32(name)])
-#   1. 丢掉 num_tokens < min_tokens 或 num_tokens > max_input_tokens 的行
-#   2. num_tokens < short_len 的行以 short_keep 的概率保留（按文件顺序，每行一个随机数）
-#   3. 从剩下的行中不放回均匀抽 num_samples 行（不够则全取）
-# 同样的 jsonl + 同样的规则 => 逐字节相同的 sampled.jsonl（manifest 里有指纹可核对）
+# 第 1 步：数据处理 + 下采样。原始数据下载见 data/README.md。
+# 每个 source：原始数据每行 -> 一个完整 message list（在最后一次 assistant 输出前截断）
+#   -> 用 chat template 统计 prefill token 数（结果缓存，换规则重抽只需几秒）
+#   -> 按下面的规则确定性地下采样，rng = numpy.random.default_rng([seed, crc32(name)])：
+#      1. 丢掉 num_tokens < min_tokens 或 num_tokens > max_input_tokens 的行
+#      2. num_tokens < short_len 的行以 short_keep 的概率保留（按文件顺序，每行一个随机数）
+#      3. 从剩下的行中不放回均匀抽 num_samples 行（不够则全取）
+#   -> 输出 <processed_dir>/<name>.jsonl
+# 同样的原始数据 + 同样的规则 => 逐字节相同的输出（manifest.json 里有指纹可核对）
 # ---------------------------------------------------------------------------
 sampling:
   seed: 20261013
@@ -22,13 +28,15 @@ sampling:
   length_buckets: [0, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072]   # 报告里的长度分段
   sources:
     - name: wildchat
-      file: wildchat.jsonl
+      format: wildchat              # 原始数据格式：wildchat / swe_rebench
+      input: data/WildChat-1M       # 原始 parquet 所在目录（递归查找）
       num_samples: 90000
       min_tokens: 0
       short_len: 512                # 短于 512 token 的 query ...
       short_keep: 0.1               # ... 只保留 10%
     - name: swe_rebench
-      file: swe_rebench.jsonl
+      format: swe_rebench
+      input: data/SWE-rebench-openhands-trajectories
       num_samples: 10000
       min_tokens: 0
       short_len: 0                  # 不做短 query 下采样

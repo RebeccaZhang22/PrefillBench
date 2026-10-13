@@ -22,7 +22,7 @@ TOK = None
 
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--sampled", required=True, help="sampled.jsonl from downsample.py")
+    p.add_argument("--sampled", required=True, nargs="+", help="downsampled jsonl files from prepare_data.py")
     p.add_argument("--config", required=True)
     p.add_argument("--tokenizer", default="", help="default: tokenizer in the config")
     p.add_argument("--out-dir", required=True)
@@ -58,9 +58,14 @@ def main():
 
     recs, offset, mismatch = [], 0, 0
     t0 = time.time()
-    with open(args.sampled) as f, open(os.path.join(args.out_dir, "prompts_ids.bin"), "wb") as bin_f, \
+    def lines():
+        for path in args.sampled:
+            with open(path) as f:
+                yield from f
+
+    with open(os.path.join(args.out_dir, "prompts_ids.bin"), "wb") as bin_f, \
             mp.Pool(args.workers, initializer=init_worker, initargs=(tokenizer,)) as pool:
-        for i, (rid, src, ntok, nturn, raw) in enumerate(pool.imap(encode, f, chunksize=8)):
+        for i, (rid, src, ntok, nturn, raw) in enumerate(pool.imap(encode, lines(), chunksize=8)):
             n = len(raw) // 4
             mismatch += n != ntok
             lo, hi = next(((a, b) for a, b in zip(edges[:-1], edges[1:]) if a <= n < b), (edges[-2], edges[-1]))
