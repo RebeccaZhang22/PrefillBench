@@ -21,6 +21,7 @@ RUNTIME_DEFAULTS = {
     "gpus": [0], "tp": [1], "attention_backend": ["default"], "mem_fraction_static": 0.7, "context_length": 131072,
     "yarn": "auto", "batch_tokens": 0, "max_requests": 0, "extra_server_args": "", "peak_tflops": 0,
     "monitor_interval": 0.5, "base_port": 31000,
+    "generation": {"enabled": False, "max_new_tokens": 2048, "default_new_tokens": 256},
 }
 PIPELINE_DEFAULTS = {"confirm": True, "stats_only": False}
 SOURCE_DEFAULTS = {"min_tokens": 0, "short_len": 0, "short_keep": 1.0}
@@ -99,6 +100,9 @@ def main():
             json.dump(samp, f, indent=2, ensure_ascii=False)
         return
 
+    gen = dict(RUNTIME_DEFAULTS["generation"], **(rt.get("generation") or {}))
+    if gen["enabled"] and int(rt["batch_tokens"]) > 0:
+        fail("runtime.generation.enabled measures single-request generation; set runtime.batch_tokens: 0")
     yarn = str(rt["yarn"]).lower()
     if yarn not in ("auto", "true", "false", "1", "0"):
         fail("runtime.yarn must be auto / true / false")
@@ -113,6 +117,8 @@ def main():
         "MAX_REQUESTS": rt["max_requests"], "EXTRA_ARGS": rt["extra_server_args"] or "",
         "PEAK_TFLOPS": rt["peak_tflops"], "MONITOR_INTERVAL": rt["monitor_interval"], "BASE_PORT": rt["base_port"],
         "CONFIRM": int(bool(pl["confirm"])), "STATS_ONLY": int(bool(pl["stats_only"])),
+        "GENERATE": int(bool(gen["enabled"])), "MAX_NEW_TOKENS": int(gen["max_new_tokens"]),
+        "DEFAULT_NEW_TOKENS": int(gen["default_new_tokens"]),
         "MAX_INPUT": samp["max_input_tokens"],
     }
     for k, v in shell.items():

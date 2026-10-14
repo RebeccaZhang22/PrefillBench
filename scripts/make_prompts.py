@@ -6,7 +6,7 @@ Each sampled line's `messages` (+ `tools`) is rendered with the chat template
 "all messages as context, prefill up to the start of the next assistant output".
 
 Outputs (in --out-dir):
-  prompts.jsonl     one record per request (orig_id, source, turns, input_len, tok_offset, length bucket)
+  prompts.jsonl     one record per request (orig_id, source, turns, input_len, output_len, tok_offset, bucket)
   prompts_ids.bin   concatenated uint32 token ids
 """
 import argparse
@@ -46,7 +46,7 @@ def encode(line):
     text = TOK.apply_chat_template(r["messages"], tools=r.get("tools"), tokenize=False, add_generation_prompt=True,
                                    enable_thinking=False)
     ids = np.asarray(TOK(text, add_special_tokens=False)["input_ids"], dtype=np.uint32)
-    return r["id"], r["source"], r["num_tokens"], r["num_turns"], ids.tobytes()
+    return r["id"], r["source"], r["num_tokens"], r["num_turns"], r.get("num_output_tokens", 0), ids.tobytes()
 
 
 def main():
@@ -65,12 +65,12 @@ def main():
 
     with open(os.path.join(args.out_dir, "prompts_ids.bin"), "wb") as bin_f, \
             mp.Pool(args.workers, initializer=init_worker, initargs=(tokenizer,)) as pool:
-        for i, (rid, src, ntok, nturn, raw) in enumerate(pool.imap(encode, lines(), chunksize=8)):
+        for i, (rid, src, ntok, nturn, nout, raw) in enumerate(pool.imap(encode, lines(), chunksize=8)):
             n = len(raw) // 4
             mismatch += n != ntok
             lo, hi = next(((a, b) for a, b in zip(edges[:-1], edges[1:]) if a <= n < b), (edges[-2], edges[-1]))
             recs.append({"id": i, "orig_id": rid, "set": "mixed", "source": src, "turns": nturn, "bucket_lo": lo,
-                         "bucket_hi": hi, "input_len": n, "tok_offset": offset})
+                         "bucket_hi": hi, "input_len": n, "output_len": nout, "tok_offset": offset})
             bin_f.write(raw)
             offset += n
             if (i + 1) % 10000 == 0:

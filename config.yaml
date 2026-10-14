@@ -63,6 +63,10 @@ runtime:
   peak_tflops: 0                    # 单卡 dense 峰值 TFLOPS，用于计算 MFU；0 = 不计算
   monitor_interval: 0.5             # nvidia-smi 采样间隔（秒）
   base_port: 31000                  # 各分片的 NCCL 端口基数（分片 i 使用 base_port + 100*i）
+  generation:                       # 完整生成测试：prefill 之后接着 decode，测 TTFT / TPOT / 端到端延迟
+    enabled: false                  # false = 只测 prefill；true = 每条请求生成到数据里真实回复的长度（忽略 EOS）
+    max_new_tokens: 2048            # 生成长度上限（同时保证 输入 + 输出 < context_length）
+    default_new_tokens: 256         # 没有参考回复的请求用这个长度
 
 pipeline:
   confirm: true                     # 第 2 步展示统计后，需要输入 y 才开始测试；false = 直接开始

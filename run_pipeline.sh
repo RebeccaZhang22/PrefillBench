@@ -102,7 +102,7 @@ if [[ "$CONFIRM" == 1 ]]; then
 fi
 
 # ---------------- [3/3] prefill ----------------
-step "[3/3] Prefill 测试 (SGLang one_batch: ModelRunner.extend)"
+step "[3/3] Prefill 测试 (SGLang one_batch: ModelRunner.extend$( (( GENERATE )) && echo ' + decode 到真实回复长度'))"
 {
   echo "host: $(hostname)"
   nvidia-smi --query-gpu=index,name,memory.total,driver_version,power.limit --format=csv,noheader 2>/dev/null || true
@@ -143,6 +143,9 @@ trap 'exit 130' INT TERM
 
 use_yarn=0
 [[ "$YARN" == 1 || ( "$YARN" == auto && "$CONTEXT_LENGTH" -gt 40960 ) ]] && use_yarn=1
+# SGLang derives Qwen3's limit as 40960 and rejects a longer --context-length unless told the extension is
+# intended; with YaRN (factor 4, 32k -> 128k) it is.
+(( use_yarn )) && export SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1
 IFS=',' read -ra GPU_ARR <<< "$GPUS"
 IFS=',' read -ra TPS <<< "$TP_LIST"
 IFS=',' read -ra ABS <<< "$ATTENTION_BACKEND_LIST"
@@ -162,7 +165,8 @@ for tp in "${TPS[@]}"; do for ab in "${ABS[@]}"; do
     args=(--model-path "$MODEL" --tp-size "$tp" --mem-fraction-static "$MEM_FRACTION" --context-length "$CONTEXT_LENGTH"
           --trust-remote-code --port "$((BASE_PORT + 100 * s))"
           --data-prompts "$OUT_DIR/dataset/prompts.jsonl" --data-out-dir "$rdir" --data-shard "$s"
-          --data-num-shards "$nshards" --data-batch-tokens "$BATCH_TOKENS" --data-max-requests "$MAX_REQUESTS")
+          --data-num-shards "$nshards" --data-batch-tokens "$BATCH_TOKENS" --data-max-requests "$MAX_REQUESTS"
+          --data-generate "$GENERATE" --data-max-new-tokens "$MAX_NEW_TOKENS" --data-default-new-tokens "$DEFAULT_NEW_TOKENS")
     (( use_yarn )) && args+=(--json-model-override-args \
       '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}')
     [[ "$ab" != default ]] && args+=(--attention-backend "$ab")
@@ -186,7 +190,7 @@ for tp in "${TPS[@]}"; do for ab in "${ABS[@]}"; do
   if (( rc )); then
     warn "$tag failed, see $rdir/shard*.log"; tail -n 20 "$rdir"/shard*.log >&2 || true; FAILED+=("$tag")
   fi
-  echo "{\"model\": \"$MODEL\", \"tp\": $tp, \"num_shards\": $nshards, \"attention_backend\": \"$ab\", \"batch_tokens\": $BATCH_TOKENS}" \
+  echo "{\"model\": \"$MODEL\", \"tp\": $tp, \"num_shards\": $nshards, \"attention_backend\": \"$ab\", \"batch_tokens\": $BATCH_TOKENS, \"generate\": $GENERATE}" \
     > "$rdir/run.json"
 done; done
 

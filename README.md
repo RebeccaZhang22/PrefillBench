@@ -41,7 +41,7 @@ flowchart TD
     Q -- 否 --> K{"confirm?<br/>测试者确认 y/N"}
     K -- N --> END2(["放弃"])
     K -- y --> S3a["[3/3] make_prompts.py<br/>套 chat template（含 tools）分词<br/>→ prompts.jsonl + prompts_ids.bin"]
-    S3a --> S3b["prefill_one_batch.py × N 个分片<br/>（GPU 按 TP 分组，每组处理 1/N 数据）<br/>SGLang 官方 one_batch：逐条 ModelRunner.extend()<br/>前后 synchronize 计时"]
+    S3a --> S3b["prefill_one_batch.py × N 个分片<br/>（GPU 按 TP 分组，每组处理 1/N 数据）<br/>SGLang 官方 one_batch：逐条 ModelRunner.extend()<br/>前后 synchronize 计时<br/>（可选：接着 decode 到真实回复长度）"]
     S3b --> L{"tp × attention_backend<br/>还有下一组配置?"}
     L -- 有 --> S3b
     L -- 无 --> S4["report.py<br/>→ results/&lt;时间戳&gt;/report.md + figs/"]
@@ -92,6 +92,7 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 
 ```json
 {"id": "swe_rebench-chatcmpl-...", "source": "swe_rebench", "num_tokens": 46466, "num_turns": 45, "num_messages": 90,
+ "num_output_tokens": 212,
  "meta": {"instance_id": "...", "repo": "...", "resolved": 1},
  "tools": [{"function": {"name": "execute_bash", "parameters": {...}}}],
  "messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."},
@@ -101,6 +102,7 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 
 - `num_tokens`：prefill 的 token 数。
 - `num_turns`：上下文中 assistant 消息的条数加 1，也就是当前正在 prefill 的是第几轮。
+- `num_output_tokens`：被截掉的那条 assistant 回复的 token 数，即这条请求在真实数据里的回复长度（WildChat 是原始回答，SWE 是 agent 的下一步，含 tool call）。只在完整生成测试中用作生成长度。
 
 ### 3. [2/3] 可视化
 
@@ -121,6 +123,7 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
    - 跑完我们的数据后，再交回官方流程收尾。
 3. **多卡**：GPU 按 `tp` 分组，每组独立处理一部分数据，相当于数据并行。例如 4 张卡、`tp: [1]` 时，会起 4 个进程，每个进程处理 1/4 的数据。如果 `tp` 或 `attention_backend` 写了多个值，会对每种组合各跑一遍。
 4. **监控**：测试期间用 nvidia-smi 记录 GPU 利用率和功耗。
+5. **完整生成测试（可选）**：把 `runtime.generation.enabled` 设为 `true` 后，每条请求 prefill 完会接着用官方的 `decode()` 逐个 token 生成，生成长度取数据中真实回复的长度（`num_output_tokens`，上限 `max_new_tokens`，且保证输入 + 输出不超过上下文长度），中途不因 EOS 停止，所以每次测试的生成长度完全一致。每一步 decode 前后都做 device synchronize，得到 **TTFT**（prefill 时间）、**TPOT**（每个输出 token 的时间）和 **端到端延迟**（TTFT + 全部 decode 时间）。这是单请求（batch size 1）的延迟测试，不代表服务端合批后的吞吐。
 
 ### 5. 报告
 
@@ -130,7 +133,10 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 - 数据分布；
 - 每组配置的总 token 数、纯计算时间、**tok/s/GPU** 和 **MFU**；
 - 按长度分桶统计的延迟（p50 / p90）、吞吐和 MFU；
-- 延迟、吞吐、MFU 随输入长度变化的散点图，以及 GPU 利用率曲线。
+- 延迟、吞吐、MFU 随输入长度变化的散点图，以及 GPU 利用率曲线；
+- 开启完整生成测试时，另有 TTFT / TPOT / 端到端延迟 / decode 占比的总表、按输入长度分段的表和对应的图。
+
+报告里数量类指标（请求数、token 数、耗时）是所有卡的合计，效率类指标（每卡 tok/s、延迟、MFU）是单卡口径，列名中都有标注。图都使用线性坐标：上排为完整长度范围，下排放大 0–16k。
 
 ## config.yaml 主要参数
 
@@ -149,12 +155,26 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 | | `gpus` / `tp` | `[0]` / `[1]` | 使用的 GPU 编号和 TP 大小；`tp` 写多个值即扫参 |
 | | `attention_backend` | `[default]` | attention backend，写多个值即扫参 |
 | | `mem_fraction_static` | 0.7 | KV 池占用的显存比例。出现 OOM 时调小；日志出现 `skip ... > KV capacity` 时调大 |
-| | `context_length` / `yarn` | 131072 / auto | 上下文长度；超过 40k 时自动开启 YaRN |
+| | `context_length` / `yarn` | 131072 / auto | 上下文长度；超过 40k 时自动开启 YaRN，并设置 `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`（否则 SGLang 会拒绝超过 40,960 的上下文） |
 | | `batch_tokens` | 0 | 0 表示每条请求单独 prefill；大于 0 时，把多条请求拼进一次 `extend()`，总长度不超过这个值 |
-| | `max_requests` | 0 | 每个分片最多跑多少条（调试用），0 表示不限 |
+| | `max_requests` | 0 | 每个分片最多跑多少条，0 表示不限。会在分片内均匀抽取，并一定包含最长的请求，所以小规模就能覆盖各种长度 |
 | | `extra_server_args` | `""` | 其他 SGLang 参数，例如 `--fp8-gemm-backend cutlass` |
 | | `peak_tflops` | 0 | 单卡峰值算力，用于计算 MFU；0 表示不计算 |
+| | `generation.enabled` | false | 是否做完整生成测试（prefill 后接 decode） |
+| | `generation.max_new_tokens` / `default_new_tokens` | 2048 / 256 | 生成长度上限；没有参考回复时使用的生成长度 |
 | `pipeline` | `confirm` / `stats_only` | true / false | 测试前是否需要确认；是否只做数据处理和可视化 |
+
+## 示例报告
+
+[`reports/h20_prefill_generation_2026-10-14.pdf`](reports/h20_prefill_generation_2026-10-14.pdf)：在 2 张 H20 上跑 2,002 条请求（每张卡从 10 万条下采样数据中均匀抽 1,000 条，另含最长的一条），同时包含纯 prefill 和完整生成两部分结果。注意这次用的是本地打过补丁的 sglang 0.5.19（`allow_version_mismatch: true`），不是固定的 0.5.21。主要结果（单卡）：
+
+| 输入长度 | prefill 每卡 tok/s | MFU（FP8 峰值 296 TFLOPS） | TTFT p50 | TPOT p50 | 端到端 p50（真实回复长度） |
+|---|---|---|---|---|---|
+| 512 – 1k | 13,756 | 66% | 52 ms | 6.1 ms | 2.6 s |
+| 2k – 4k | 13,420 | 67% | 214 ms | 6.3 ms | 2.4 s |
+| 8k – 16k | 11,222 | 67% | 1.0 s | 7.1 ms | 5.2 s |
+| 32k – 64k | 5,959 | 58% | 8.3 s | 10.3 ms | 14.5 s |
+| 64k – 128k | 4,212 | 55% | 15.6 s | 12.2 ms | 23.8 s |
 
 ## 目录与输出
 

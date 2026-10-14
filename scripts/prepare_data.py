@@ -15,8 +15,10 @@ For every source in the sampling config:
   4. write the selected rows, in file order, to <out-dir>/<name>.jsonl
 
 Line format (keys in this order):
-  {"id", "source", "num_tokens", "num_turns", "num_messages", "meta", ["tools"], "messages"}
+  {"id", "source", "num_tokens", "num_turns", "num_messages", "num_output_tokens", "meta", ["tools"], "messages"}
   num_turns = assistant messages in the context + 1 (the turn being prefilled)
+  num_output_tokens = tokens of the assistant reply that was cut off (content + tool calls + <|im_end|>), i.e.
+                      the real response length; used as the generation length in generation mode (0 = none)
 
 Also written: <out-dir>/sample_index.csv (source,id,num_tokens,num_turns) and <out-dir>/manifest.json
 (rule, per-source counts, sha256 fingerprint of the selected ids). The whole step is skipped when the
@@ -37,6 +39,7 @@ import pyarrow.parquet as pq
 
 TOK = None
 INDEX_VERSION = 1
+OUTPUT_VERSION = 2  # 2: lines carry num_output_tokens (length of the reply that was cut off)
 
 
 def parse_args():
@@ -63,9 +66,11 @@ def strip_none(x):
 
 
 def drop_trailing_assistant(msgs):
+    """Cut the conversation before its final assistant output; return (messages, that assistant message)."""
+    answer = None
     while msgs and msgs[-1]["role"] == "assistant":
-        msgs.pop()
-    return msgs
+        answer = msgs.pop()
+    return msgs, answer
 
 
 def convert_wildchat(row):
@@ -73,11 +78,12 @@ def convert_wildchat(row):
     msgs = [m for m in msgs if m["role"] in ("user", "assistant") and isinstance(m["content"], str) and m["content"].strip()]
     while msgs and msgs[0]["role"] != "user":
         msgs.pop(0)
-    msgs = drop_trailing_assistant(msgs)
+    msgs, answer = drop_trailing_assistant(msgs)
     if not msgs:
         return None
     meta = {k: row.get(k) for k in ("conversation_hash", "model", "language") if row.get(k) is not None}
-    return {"id": f"wildchat-{row.get('conversation_hash')}", "meta": meta, "tools": None, "messages": msgs}
+    return {"id": f"wildchat-{row.get('conversation_hash')}", "meta": meta, "tools": None, "messages": msgs,
+            "answer": answer}
 
 
 def convert_swe(row):
@@ -88,13 +94,13 @@ def convert_swe(row):
             continue
         m["content"] = m.get("content") or ""
         msgs.append(m)
-    msgs = drop_trailing_assistant(msgs)
+    msgs, answer = drop_trailing_assistant(msgs)
     if not any(m["role"] in ("user", "tool") for m in msgs):
         return None
     meta = {k: row.get(k) for k in ("trajectory_id", "instance_id", "repo", "resolved", "exit_status")
             if row.get(k) is not None}
     return {"id": f"swe_rebench-{row.get('trajectory_id')}", "meta": meta,
-            "tools": strip_none(row.get("tools") or []) or None, "messages": msgs}
+            "tools": strip_none(row.get("tools") or []) or None, "messages": msgs, "answer": answer}
 
 
 FORMATS = {  # converter, parquet columns, read batch size
@@ -124,14 +130,28 @@ def measure(task):
         sum(m["role"] == "assistant" for m in rec["messages"]) + 1
 
 
+def answer_tokens(answer):
+    """Tokens the model would generate for the cut-off reply: content + tool calls + <|im_end|>; 0 if none."""
+    if not answer:
+        return 0
+    text = answer.get("content") or ""
+    for tc in answer.get("tool_calls") or []:
+        fn = tc.get("function") or {}
+        text += '\n<tool_call>\n{"name": "' + (fn.get("name") or "") + '", "arguments": ' + \
+            (fn.get("arguments") or "{}") + "}\n</tool_call>"
+    return len(TOK(text, add_special_tokens=False)["input_ids"]) + 1
+
+
 def render_line(fmt, row, ntok, nturn):
+    """Returns (json line, num_output_tokens)."""
     rec = FORMATS[fmt][0](row)
+    nout = answer_tokens(rec["answer"])
     out = {"id": rec["id"], "source": fmt, "num_tokens": int(ntok), "num_turns": int(nturn),
-           "num_messages": len(rec["messages"]), "meta": rec["meta"]}
+           "num_messages": len(rec["messages"]), "num_output_tokens": nout, "meta": rec["meta"]}
     if rec["tools"]:
         out["tools"] = rec["tools"]
     out["messages"] = rec["messages"]
-    return json.dumps(out, ensure_ascii=False) + "\n"
+    return json.dumps(out, ensure_ascii=False) + "\n", nout
 
 
 # ---------------------------------------------------------------- helpers
@@ -208,7 +228,7 @@ def main():
 
     sources = [(s, parquet_files(s["input"])) for s in cfg["sources"]]
     rule_key = {"sampling": {k: v for k, v in cfg.items() if k != "length_buckets"},
-                "inputs": {s["name"]: input_signature(f) for s, f in sources}}
+                "inputs": {s["name"]: input_signature(f) for s, f in sources}, "output_version": OUTPUT_VERSION}
     if os.path.exists(man_path):
         old = json.load(open(man_path))
         if old.get("rule_key") == rule_key and all(
@@ -216,11 +236,12 @@ def main():
             log(f"outputs in {args.out_dir} already match this rule and these inputs, skipping")
             return
 
+    init_worker(cfg["tokenizer"])  # main-process tokenizer, for the output lengths of the selected rows
     fp = hashlib.sha256()
     summary = []
     with open(os.path.join(args.out_dir, "sample_index.csv"), "w", newline="") as idx_f:
         w = csv.writer(idx_f)
-        w.writerow(["source", "id", "num_tokens", "num_turns"])
+        w.writerow(["source", "id", "num_tokens", "num_turns", "num_output_tokens"])
         for s, files in sources:
             name, fmt = s["name"], s["format"]
             cache = os.path.join(args.out_dir, ".index", f"{name}.npz")
@@ -230,14 +251,16 @@ def main():
             out_path = os.path.join(args.out_dir, name + ".jsonl")
             t0 = time.time()
             _, columns, batch_size = FORMATS[fmt]
+            nout = {}
             with open(out_path + ".tmp", "w") as out:
                 for p, row in iter_rows(files, columns, batch_size):
                     j = want.get(p)
                     if j is not None:
-                        out.write(render_line(fmt, row, ntok[j], nturn[j]))
+                        line, nout[j] = render_line(fmt, row, ntok[j], nturn[j])
+                        out.write(line)
             os.replace(out_path + ".tmp", out_path)
             for j in pick:
-                w.writerow([name, ids[j], ntok[j], nturn[j]])
+                w.writerow([name, ids[j], ntok[j], nturn[j], nout[j]])
                 fp.update(ids[j].encode() + b"\n")
             if len(pick) < s["num_samples"]:
                 log(f"WARNING {name}: only {len(pick)} eligible rows, wanted {s['num_samples']}")
@@ -245,6 +268,7 @@ def main():
                             "over_max_input": int((ntok > cfg["max_input_tokens"]).sum()),
                             "eligible_after_rule": n_eligible, "sampled": int(len(pick)),
                             "sampled_tokens": int(ntok[pick].sum()),
+                            "sampled_output_tokens": int(sum(nout.values())),
                             "size_bytes": os.path.getsize(out_path)})
             log(f"{name}: {len(ntok):,} rows -> {n_eligible:,} eligible -> {len(pick):,} sampled "
                 f"({ntok[pick].sum() / 1e6:.1f}M tokens) -> {out_path} [{time.time() - t0:.0f}s]")
