@@ -14,6 +14,11 @@ Pinned to SGLang 0.5.21 (checked against its source: load_model / prepare_synthe
 _TorchBenchRunner.{clear,extend,synchronize} / main / BenchArgs; TP workers are spawned, and this module
 re-applies the hook when the spawned child re-imports it). run_pipeline.sh refuses other versions by default.
 
+Latent mode (--data-latent-layer L, 0-based decoder block): the model is cut after block L before CUDA graphs are
+captured, so every extend() runs embedding + blocks 0..L and returns the block-L residual stream
+(hidden + residual, no final RMSNorm) of each request's last token. The final norm, lm_head and sampling are
+skipped. See latent_exit.py; the installed SGLang files are untouched.
+
 Inputs: prompts.jsonl + prompts_ids.bin from make_prompts.py.
 With --data-generate 1 each request is then decoded to its real reply length (output_len from the data, capped
 by --data-max-new-tokens, EOS ignored) with the official decode(), every step timed between device synchronizes:
@@ -40,6 +45,8 @@ except ImportError:  # older SGLang
     import sglang.bench_one_batch as ob
 from sglang.srt.server_args import ServerArgs
 
+import latent_exit
+
 ENV = "GPUBENCH_PREFILL_CFG"
 
 
@@ -62,9 +69,14 @@ def runner_ops(mr):
             (lambda: ob.synchronize(raw.device)), cap)
 
 
-def flops_fn(model_path):
-    """Prefill FLOPs of an L-token request (dense matmuls + causal attention); used to weight the ETA.
-    Falls back to plain token counts if the model config cannot be read."""
+def _latent_layer():
+    cfg = os.environ.get(ENV)
+    return json.loads(cfg).get("latent_layer", -1) if cfg else -1
+
+
+def flops_fn(model_path, num_layers=None):
+    """Prefill FLOPs of an L-token request (dense matmuls + causal attention over `num_layers` blocks, all by
+    default); used to weight the ETA. Falls back to plain token counts if the model config cannot be read."""
     try:
         path = os.path.join(model_path, "config.json")
         if not os.path.exists(path):
@@ -72,7 +84,7 @@ def flops_fn(model_path):
             path = hf_hub_download(model_path, "config.json")
         c = json.load(open(path))
         c = c.get("text_config", c)
-        h, layers, nh = c["hidden_size"], c["num_hidden_layers"], c["num_attention_heads"]
+        h, layers, nh = c["hidden_size"], num_layers or c["num_hidden_layers"], c["num_attention_heads"]
         nkv, hd = c.get("num_key_value_heads", nh), c.get("head_dim") or h // nh
         linear = layers * (h * nh * hd + 2 * h * nkv * hd + nh * hd * h + 3 * h * c["intermediate_size"])
         attn = layers * nh * hd
@@ -102,6 +114,11 @@ def run_dataset(model_runner, tp_rank):
     say = log if is_main else (lambda *_: None)
     clear, extend, decode, sync, cap = runner_ops(model_runner)
     gen = cfg["generate"]
+    latent = cfg["latent_layer"]
+    raw = getattr(model_runner, "torch_runner", model_runner)
+    if latent >= 0 and getattr(raw, "_gpubench_latent", None) != latent:
+        raise RuntimeError("latent exit was not applied before CUDA graph capture (ModelRunner.init_cuda_graphs hook)")
+    hidden = raw.model_config.hidden_size
 
     recs = [json.loads(line) for line in open(cfg["prompts"])]
     recs = [r for r in recs if r.get("set", "mixed") == "mixed"][cfg["shard"]::cfg["num_shards"]]
@@ -117,11 +134,14 @@ def run_dataset(model_runner, tp_rank):
         n = r.get("output_len") or cfg["default_new_tokens"]
         r["gen_len"] = max(1, min(n, cfg["max_new_tokens"], cfg["context_length"] - r["input_len"] - 1)) if gen else 1
     batches = make_batches(recs, cfg["batch_tokens"], cfg["max_batch"])
-    flops = flops_fn(cfg["model_path"])
+    flops = flops_fn(cfg["model_path"], latent + 1 if latent >= 0 else None)
     # ETA weights: prefill FLOPs, plus decode steps counted as ~64 prefill tokens each (a memory-bound step at bs=1
     # costs roughly as long as prefilling a few dozen tokens)
     work = [sum(flops(r["input_len"]) + (r["gen_len"] - 1) * flops(64) for r in b) for b in batches]
     total_work = sum(work)
+    if latent >= 0:
+        say(f"latent mode: prefill runs decoder blocks 0..{latent} ({latent + 1} blocks), output = block-{latent} "
+            f"residual stream of the last token; final norm / lm_head / sampling skipped")
     say(f"shard {cfg['shard']}/{cfg['num_shards']}: {len(recs):,} requests, "
         f"{sum(r['input_len'] for r in recs) / 1e6:.1f}M tokens, {len(batches):,} batches, KV capacity {cap}")
 
@@ -134,9 +154,12 @@ def run_dataset(model_runner, tp_rank):
         reqs = ob.prepare_synthetic_inputs_for_latency_test(len(inputs), max(map(len, inputs)), inputs)
         sync()
         t0 = time.perf_counter()
-        next_ids, _, fwd_batch = extend(reqs)
+        next_ids, out, fwd_batch = extend(reqs)
         sync()
         t1 = time.perf_counter()
+        if latent >= 0 and tuple(out.shape) != (len(batch), hidden):
+            raise RuntimeError(f"latent mode: expected output [{len(batch)}, {hidden}], got {tuple(out.shape)} "
+                               "(the full model ran, e.g. a CUDA graph captured before the cut)")
         steps = []
         for _ in range(max(r["gen_len"] for r in batch) - 1):
             ts = time.perf_counter()
@@ -203,6 +226,7 @@ def _load_model_then_run_dataset(server_args, port_args, gpu_id, tp_rank):
 
 # Applied at import time so that TP worker processes (spawned by one_batch.main) get it too.
 ob.load_model = _load_model_then_run_dataset
+latent_exit.install(_latent_layer)
 
 
 def main():
@@ -225,6 +249,9 @@ def main():
     g.add_argument("--data-max-new-tokens", type=int, default=2048, help="cap on the generation length")
     g.add_argument("--data-default-new-tokens", type=int, default=256,
                    help="generation length for requests without a reference reply")
+    g.add_argument("--data-latent-layer", type=int, default=-1,
+                   help="-1 = full model; L >= 0 = stop prefill after decoder block L (0-based) and return its "
+                        "residual stream (no final norm, lm_head or sampling)")
     args = parser.parse_args()
 
     os.makedirs(args.data_out_dir, exist_ok=True)
@@ -234,9 +261,12 @@ def main():
         "shard": args.data_shard, "num_shards": args.data_num_shards, "batch_tokens": args.data_batch_tokens,
         "max_batch": args.data_max_batch, "max_requests": args.data_max_requests, "warmup": args.data_warmup,
         "generate": bool(args.data_generate), "max_new_tokens": args.data_max_new_tokens,
-        "default_new_tokens": args.data_default_new_tokens, "context_length": args.context_length or 131072})
+        "default_new_tokens": args.data_default_new_tokens, "context_length": args.context_length or 131072,
+        "latent_layer": args.data_latent_layer})
     if args.data_generate and args.data_batch_tokens > 0:
         parser.error("--data-generate measures single-request generation; use --data-batch-tokens 0")
+    if args.data_generate and args.data_latent_layer >= 0:
+        parser.error("--data-latent-layer has no lm_head, so it cannot generate; use --data-generate 0")
     # the official sweep that runs after our loop: one tiny batch, results to a side file
     args.batch_size, args.input_len, args.output_len = [1], [16], [1]
     args.result_filename = os.path.join(args.data_out_dir, f"one_batch_tail_shard{args.data_shard}.jsonl")

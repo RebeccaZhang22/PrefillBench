@@ -60,6 +60,9 @@ runtime:
   batch_tokens: 0                   # 0 = 每条请求单独一次 prefill；>0 = 把相邻请求拼进一次 extend()，直到该 token 数
   max_requests: 0                   # 每个分片最多跑多少条（调试用），0 = 全部
   extra_server_args: ""             # 其他 SGLang 参数，如 "--fp8-gemm-backend cutlass"
+  latent_layer: [full]              # prefill 算到哪一层：full = 完整模型；整数 L = 只跑 decoder block 0..L（0-based），
+                                    # 输出第 L 层残差流（latent），不做最终 norm / lm_head / 采样。
+                                    # 写多个值 = 扫参，如 [full, 8, 17, 26]；Qwen3-8B 共 36 层（0..35）。不能与 generation 同开
   peak_tflops: 0                    # 单卡 dense 峰值 TFLOPS，用于计算 MFU；0 = 不计算
   monitor_interval: 0.5             # nvidia-smi 采样间隔（秒）
   base_port: 31000                  # 各分片的 NCCL 端口基数（分片 i 使用 base_port + 100*i）

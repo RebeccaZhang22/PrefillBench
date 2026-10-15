@@ -118,12 +118,18 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 ### 4. [3/3] 纯 prefill 测试
 
 1. **分词**：[`scripts/make_prompts.py`](scripts/make_prompts.py) 把两个 jsonl 里的 `messages`（以及 `tools`）套上 chat template 并分词，结果写入 `prompts.jsonl` 和 `prompts_ids.bin`。
-2. **计时**：[`scripts/prefill_one_batch.py`](scripts/prefill_one_batch.py) 基于 SGLang 官方的 `sglang.benchmark.one_batch`（[官方文档](https://github.com/sgl-project/sglang/blob/main/docs/docs/developer_guide/benchmark_and_profiling.mdx)），只替换了其中的 `load_model` 一个函数，其余逻辑都是官方原样。
+2. **计时**：[`scripts/prefill_one_batch.py`](scripts/prefill_one_batch.py) 基于 SGLang 官方的 `sglang.benchmark.one_batch`（[官方文档](https://github.com/sgl-project/sglang/blob/main/docs/docs/developer_guide/benchmark_and_profiling.mdx)），只替换了其中的 `load_model` 一个函数（latent 模式下还会包一层 `ModelRunner.init_cuda_graphs`，见下面第 6 点），其余逻辑都是官方原样。
    - 每个 rank 加载完模型后，逐条执行官方的 `extend()`，前后各调用一次 device synchronize 计时；
    - 跑完我们的数据后，再交回官方流程收尾。
 3. **多卡**：GPU 按 `tp` 分组，每组独立处理一部分数据，相当于数据并行。例如 4 张卡、`tp: [1]` 时，会起 4 个进程，每个进程处理 1/4 的数据。如果 `tp` 或 `attention_backend` 写了多个值，会对每种组合各跑一遍。
 4. **监控**：测试期间用 nvidia-smi 记录 GPU 利用率和功耗。
 5. **完整生成测试（可选）**：把 `runtime.generation.enabled` 设为 `true` 后，每条请求 prefill 完会接着用官方的 `decode()` 逐个 token 生成，生成长度取数据中真实回复的长度（`num_output_tokens`，上限 `max_new_tokens`，且保证输入 + 输出不超过上下文长度），中途不因 EOS 停止，所以每次测试的生成长度完全一致。每一步 decode 前后都做 device synchronize，得到 **TTFT**（prefill 时间）、**TPOT**（每个输出 token 的时间）和 **端到端延迟**（TTFT + 全部 decode 时间）。这是单请求（batch size 1）的延迟测试，不代表服务端合批后的吞吐。
+6. **中间层 latent 测试（可选）**：如果只需要模型中间某一层的 latent（隐层表示），不需要后面的层，可以把 `runtime.latent_layer` 设为 decoder block 编号 L（从 0 开始；Qwen3-8B 共 36 层，即 0..35）。这样测到的是"只算到第 L 层"的 prefill 延迟和吞吐：
+   - **做法**：在 CUDA graph 捕获**之前**，对已经加载的模型做运行时替换（不改 SGLang 安装目录下的文件）：decoder 循环只跑 block 0..L，最终 RMSNorm 换成"只把 hidden 和 residual 相加"，`logits_processor` 换成"取每条请求最后一个 token 的 latent"，`sample` 换成空操作。所以计时范围是 embedding、block 0..L，以及取出最后一个 token 第 L 层残差流 `[请求数, hidden]`，**不含最终 norm、lm_head 和采样**。
+   - **latent 的含义**：第 L 个 block 的输出残差流（`hidden_states + residual`，未做 norm），和 CoolWatch featurizer、activation-capture 中的 `layer=L` / `block_output` 是同一个位置。latent 留在 GPU 上，不拷回 CPU、也不落盘。
+   - **扫参**：可以写多个值，例如 `latent_layer: [full, 8, 17, 26]`，每个值单独跑一遍，配置名带 `_L<L>` 后缀；`full` 就是原来的完整模型。报告里的 MFU 只按实际算了的层计算（不含 lm_head）。
+   - **校验**：每次 extend 都会检查输出形状是否为 `[请求数, hidden]`；如果实际跑的是完整模型（例如某个 CUDA graph 是在截断前捕获的），会直接报错，不会悄悄测错。
+   - **限制**：不能和 `generation.enabled` 同时开（没有 lm_head 就无法生成）；不支持 PP；只在 Qwen2/Qwen3 结构的模型上实现。KV 池仍然按全部层分配，这不影响计时。TP>1 没有验证过。
 
 ### 5. 报告
 
@@ -137,6 +143,27 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 - 开启完整生成测试时，另有 TTFT / TPOT / 端到端延迟 / decode 占比的总表、按输入长度分段的表和对应的图。
 
 报告里数量类指标（请求数、token 数、耗时）是所有卡的合计，效率类指标（每卡 tok/s、延迟、MFU）是单卡口径，列名中都有标注。图都使用线性坐标：上排为完整长度范围，下排放大 0–16k。
+
+## 请求形状 × 并发测试（真实调度器）
+
+上面的 one_batch 测试绕过了调度器，测不了"打满并发""复用 KV cache""chunked prefill 设多大""给定延迟最多支持多少并发"这类问题。这些由 [`run_serve_bench.sh`](run_serve_bench.sh) + [`scripts/serve_bench.py`](scripts/serve_bench.py) 负责，配置在 [`shape.yaml`](shape.yaml)：
+
+```bash
+bash run_serve_bench.sh                                   # 默认 shape.yaml
+bash run_serve_bench.sh shape.yaml --shapes short --prefill-sizes 4096   # 只跑一部分
+```
+
+- **数据**：WildChat 中 3.5k–4.5k token 的对话 1 万条（短），SWE 轨迹中 56k–72k token 的 1 万条（长）。用的是同一套 `prepare_data.py`，只是每个 source 多了一个 `max_tokens` 长度上限；长度索引直接复用 `data/processed/.index` 的缓存。这 1 万条只作样本池：每个并发档位跑到稳态就停，不会把 1 万条全跑完（全跑完 64k 那批单卡要 20 小时左右）。
+- **服务端**：进程内 SGLang Engine（真实调度器、continuous batching、chunked prefill、radix cache），直接传 token ids，`max_new_tokens=1`，所以 prefill 完就结束，没有 decode。`serve.latent_layer: 23` 表示只跑 decoder block 0..23（36 层的 2/3），模型按 24 层构建（`num_hidden_layers` 覆盖），权重和 KV 池也只按 24 层分配；final norm、lm_head 用 [`latent_exit.py`](scripts/latent_exit.py) 去掉，采样器只拿到一个全零 logits。
+- **四种请求形状**：
+  - `short`：独立的 ~4k 请求（radix cache 关）；
+  - `long`：独立的 ~64k 请求，一次性 prefill（radix cache 关）；
+  - `long_seg_cache`：一条长轨迹在最接近 1/4、2/4、3/4 长度的 assistant 轮次边界切开，变成 4 个累积前缀请求（约 16k / 32k / 48k / 64k），按顺序发送。radix cache 开，所以后一段会复用前一段的 KV（前提是还没被逐出）；
+  - `long_seg_nocache`：同样的 4 段请求，但 radix cache 关，相当于前面轮次的 KV 已经被逐出，每一段都要把整个前缀重算一遍。
+- **prefill size**：`serve.prefill_sizes: [4096, default]`。整数表示同时设 `chunked_prefill_size` 和 `max_prefill_tokens`，即一次前向最多处理多少 token；`default` 表示不设，由 SGLang 按显存自动选（H20：chunk 8192，max_prefill_tokens 16384）。
+- **并发**：闭环，始终有 C 个请求（分段形状里是 C 条轨迹）在途。每档至少跑 60 秒，并且至少完成 4×C 个请求，才停止发新请求。统计窗口从开始发请求到停止发请求为止，跨越窗口边界的请求按重叠比例计入。
+- **指标**：计算 tok/s（输入 token 减去缓存命中，即 GPU 实际 prefill 的量）、服务 tok/s（全部输入 token）、每个请求的延迟 p50/p90/p99（客户端从提交到完成，含排队）。报告 `serve_report.md` 会列出每种形状、每个 prefill size 在各个延迟要求下（`serve.slo_seconds`，按 p90）能支持的最大并发。
+- **注意**：SGLang 第一次启动时会给 DeepGEMM（FP8 矩阵乘法）做 JIT 预编译，范围是 M ≤ 2 × chunk（chunk ≤ 8192 时 M ≤ 16384，上限 131072），结果缓存在 `~/.cache/sglang`。chunk 设得很大（比如 256k）时，第一次编译要几个小时。
 
 ## config.yaml 主要参数
 
@@ -160,6 +187,7 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 | | `max_requests` | 0 | 每个分片最多跑多少条，0 表示不限。会在分片内均匀抽取，并一定包含最长的请求，所以小规模就能覆盖各种长度 |
 | | `extra_server_args` | `""` | 其他 SGLang 参数，例如 `--fp8-gemm-backend cutlass` |
 | | `peak_tflops` | 0 | 单卡峰值算力，用于计算 MFU；0 表示不计算 |
+| | `latent_layer` | `[full]` | prefill 算到哪一层：`full` = 完整模型；整数 L = 只跑 decoder block 0..L，输出第 L 层 latent；写多个值则扫参 |
 | | `generation.enabled` | false | 是否做完整生成测试（prefill 后接 decode） |
 | | `generation.max_new_tokens` / `default_new_tokens` | 2048 / 256 | 生成长度上限；没有参考回复时使用的生成长度 |
 | `pipeline` | `confirm` / `stats_only` | true / false | 测试前是否需要确认；是否只做数据处理和可视化 |
@@ -175,6 +203,13 @@ pip install sglang==0.5.21 pyyaml pyarrow matplotlib
 | 8k – 16k | 11,222 | 67% | 1.0 s | 7.1 ms | 5.2 s |
 | 32k – 64k | 5,959 | 58% | 8.3 s | 10.3 ms | 14.5 s |
 | 64k – 128k | 4,212 | 55% | 15.6 s | 12.2 ms | 23.8 s |
+
+[`reports/h20_latent_l23_request_shapes_2026-10-15.pdf`](reports/h20_latent_l23_request_shapes_2026-10-15.pdf)：`run_serve_bench.sh` + `shape.yaml` 在 1 张 H20 上的结果，只算到第 23 层（36 层的 2/3），比较 4k / 64k / 64k 分 4 段（复用与不复用 KV cache）在不同并发下的吞吐和延迟，以及 prefill size 4k 与默认值的差别。用的是官方 sglang 0.5.19 wheel（未打补丁）。主要结论：
+
+- 单个请求就基本把 GPU 占满：并发 1 时吞吐已达打满时的 84–88%（4k 请求约 23.4k tok/s，64k 请求约 8.5k tok/s），再加并发只是排队，延迟和并发数成正比；
+- prefill size 4k 和默认值（chunk 8192）的吞吐只差 0.3–2%；
+- 给定延迟下的最大并发 ≈ 延迟要求 × 吞吐 ÷ 每个请求的 token 数（4k 请求 p90 ≤ 1 s 约 4 个并发，64k 请求 p90 ≤ 60 s 约 4 个）；
+- 分段复用 KV cache 时服务的 token 数翻倍，但在途轨迹的 KV 总量超过 KV 池后，缓存被逐出，优势消失。
 
 ## 目录与输出
 

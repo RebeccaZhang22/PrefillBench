@@ -10,7 +10,8 @@ For every source in the sampling config:
      enable_thinking=False). Lengths are cached in <out-dir>/.index/ and reused while the input files and
      tokenizer are unchanged, so re-sampling with another seed / rule takes seconds.
   3. downsample with the rule (numpy default_rng([seed, crc32(name)]), one uniform draw per row in file order):
-       drop num_tokens < min_tokens or > max_input_tokens; keep rows shorter than short_len with prob short_keep;
+       drop num_tokens < min_tokens or > min(max_input_tokens, max_tokens); keep rows shorter than short_len with
+       prob short_keep;
        then draw num_samples rows uniformly without replacement
   4. write the selected rows, in file order, to <out-dir>/<name>.jsonl
 
@@ -212,7 +213,7 @@ def build_index(src, fmt, files, tokenizer, workers, cache_path):
 def select(rule, ntok, max_input, seed):
     rng = np.random.default_rng([seed, zlib.crc32(rule["name"].encode())])
     u = rng.random(len(ntok))  # one draw per row, file order
-    ok = (ntok >= rule.get("min_tokens", 0)) & (ntok <= max_input)
+    ok = (ntok >= rule.get("min_tokens", 0)) & (ntok <= min(max_input, rule.get("max_tokens") or max_input))
     ok &= (ntok >= rule.get("short_len", 0)) | (u < rule.get("short_keep", 1.0))
     cand = np.flatnonzero(ok)
     k = min(rule["num_samples"], len(cand))

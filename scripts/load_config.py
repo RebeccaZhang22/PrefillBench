@@ -20,7 +20,7 @@ RUNTIME_DEFAULTS = {
     "python": "python3", "sglang_version": "0.5.21", "allow_version_mismatch": False, "model": "Qwen/Qwen3-8B-FP8",
     "gpus": [0], "tp": [1], "attention_backend": ["default"], "mem_fraction_static": 0.7, "context_length": 131072,
     "yarn": "auto", "batch_tokens": 0, "max_requests": 0, "extra_server_args": "", "peak_tflops": 0,
-    "monitor_interval": 0.5, "base_port": 31000,
+    "monitor_interval": 0.5, "base_port": 31000, "latent_layer": ["full"],
     "generation": {"enabled": False, "max_new_tokens": 2048, "default_new_tokens": 256},
 }
 PIPELINE_DEFAULTS = {"confirm": True, "stats_only": False}
@@ -57,6 +57,8 @@ def load(path, root):
         names.add(s["name"])
         for k, v in SOURCE_DEFAULTS.items():
             s.setdefault(k, v)
+        if s.get("max_tokens") is not None and int(s["max_tokens"]) < int(s["min_tokens"]):
+            fail(f"sampling.sources[{i}].max_tokens must be >= min_tokens")
         if not 0 <= float(s["short_keep"]) <= 1:
             fail(f"sampling.sources[{i}].short_keep must be in [0, 1]")
     if sorted(samp["length_buckets"]) != samp["length_buckets"]:
@@ -103,6 +105,17 @@ def main():
     gen = dict(RUNTIME_DEFAULTS["generation"], **(rt.get("generation") or {}))
     if gen["enabled"] and int(rt["batch_tokens"]) > 0:
         fail("runtime.generation.enabled measures single-request generation; set runtime.batch_tokens: 0")
+    latent = []
+    for v in as_list(rt["latent_layer"]):
+        if str(v).lower() in ("full", "none", "-1"):
+            latent.append(-1)
+        elif isinstance(v, int) and not isinstance(v, bool) and v >= 0:
+            latent.append(v)
+        else:
+            fail(f"runtime.latent_layer entries must be full or a 0-based decoder block index >= 0, got {v!r}")
+    if gen["enabled"] and any(v >= 0 for v in latent):
+        fail("runtime.latent_layer stops before the lm_head, so it cannot generate; set runtime.generation.enabled: "
+             "false or runtime.latent_layer: [full]")
     yarn = str(rt["yarn"]).lower()
     if yarn not in ("auto", "true", "false", "1", "0"):
         fail("runtime.yarn must be auto / true / false")
@@ -118,7 +131,7 @@ def main():
         "PEAK_TFLOPS": rt["peak_tflops"], "MONITOR_INTERVAL": rt["monitor_interval"], "BASE_PORT": rt["base_port"],
         "CONFIRM": int(bool(pl["confirm"])), "STATS_ONLY": int(bool(pl["stats_only"])),
         "GENERATE": int(bool(gen["enabled"])), "MAX_NEW_TOKENS": int(gen["max_new_tokens"]),
-        "DEFAULT_NEW_TOKENS": int(gen["default_new_tokens"]),
+        "DEFAULT_NEW_TOKENS": int(gen["default_new_tokens"]), "LATENT_LIST": ",".join(map(str, latent)),
         "MAX_INPUT": samp["max_input_tokens"],
     }
     for k, v in shell.items():

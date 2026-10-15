@@ -1,0 +1,58 @@
+# 请求形状测试：短请求 4k / 长请求 64k / 长请求分 4 段（复用 KV cache vs 不复用），
+# 在真实 SGLang 调度器上打满并发，测 prefill token 吞吐和延迟，回答"给定延迟要求下最多支持多少并发"。
+# 运行：bash run_serve_bench.sh shape.yaml
+# 只算到中间层：serve.latent_layer（Qwen3-8B 共 36 层，23 = 2/3 深度，只跑 block 0..23）。
+
+paths:
+  processed_dir: data/processed_shape   # 本测试的下采样结果（与 config.yaml 的 data/processed 分开）
+  out_dir: auto                         # auto = results/shape_<时间戳>
+
+processing:
+  workers: 0
+
+# 两批请求：WildChat 中 3.5k–4.5k token 的对话 1 万条（短），SWE 轨迹中 56k–72k token 的 1 万条（长）。
+# 长度索引复用 data/processed/.index 的缓存（同一份原始数据和 tokenizer）。
+sampling:
+  seed: 20261015
+  tokenizer: Qwen/Qwen3-8B-FP8      # 与 config.yaml 相同，才能复用长度索引缓存
+  max_input_tokens: 80000
+  length_buckets: [0, 3584, 4608, 57344, 73728, 131072]
+  sources:
+    - name: wildchat
+      format: wildchat
+      input: data/WildChat-1M
+      num_samples: 10000
+      min_tokens: 3584
+      max_tokens: 4608
+    - name: swe_rebench
+      format: swe_rebench
+      input: data/SWE-rebench-openhands-trajectories
+      num_samples: 10000
+      min_tokens: 57344
+      max_tokens: 73728
+
+runtime:
+  python: python3                   # 装有 sglang 的 python（示例报告用的是官方 0.5.19 wheel），如 /opt/venv/bin/python
+  sglang_version: "0.5.19"
+  model: Qwen/Qwen3-8B-FP8          # 模型路径或 HF id
+  gpus: [0]                         # 只用第一张卡（单卡测试）
+  context_length: 81920
+
+# 在线测试（scripts/serve_bench.py）：进程内 SGLang Engine（真实调度器 + chunked prefill + radix cache），
+# 直接传 token ids，max_new_tokens=1（prefill 完即结束，没有 decode）。
+serve:
+  latent_layer: 23                  # 只跑 decoder block 0..23，输出第 23 层残差流；full = 完整模型
+  prefill_sizes: [4096, default]    # 整数 = 同时设 chunked_prefill_size 和 max_prefill_tokens；
+                                    # default = SGLang 按显存自动选（H20：chunk 8192，max_prefill_tokens 16384）
+  mem_fraction_static: 0.75
+  shapes:                           # 每种形状扫的并发数（闭环：始终有 C 个请求 / 轨迹在途）
+    short: [1, 2, 4, 8, 16, 32, 64, 128, 256]
+    long: [1, 2, 4, 8, 16, 32]
+    long_seg_cache: [1, 2, 4, 8, 16, 32]     # 每条长轨迹在 assistant 轮次边界切成 4 段，顺序发送，radix cache 开
+    long_seg_nocache: [1, 2, 4, 8, 16, 32]   # 同样的 4 段请求，radix cache 关：每段都要重算前缀
+  level_min_seconds: 60             # 每个并发档位至少跑这么久 ...
+  level_min_requests_per_conc: 4    # ... 且至少完成 4 x C 个请求，才停止发新请求
+  level_max_seconds: 900            # 每档上限
+  slo_seconds:                      # 报告里"满足延迟要求的最大并发"用的延迟档位（按 p90）
+    short: [0.25, 0.5, 1, 2]
+    long: [10, 20, 30, 60]

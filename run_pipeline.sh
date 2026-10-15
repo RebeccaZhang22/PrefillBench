@@ -11,6 +11,7 @@
 #   [2/3] visualize    token + turn distribution, printed and saved; tester confirms
 #   [3/3] prefill      tokenize -> SGLang official one_batch (ModelRunner.extend; no server / HTTP /
 #                      scheduler / chunking) over every sampled request -> report.md
+#                      (runtime.latent_layer: optionally stop prefill after decoder block L, see README)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -21,7 +22,7 @@ for a in "$@"; do
   case "$a" in
     --stats-only) FORCE_STATS_ONLY=1;;
     --yes|-y) FORCE_YES=1;;
-    -h|--help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    -h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
     -*) echo "unknown option: $a" >&2; exit 1;;
     *) CONFIG_FILE="$a";;
   esac
@@ -102,7 +103,7 @@ if [[ "$CONFIRM" == 1 ]]; then
 fi
 
 # ---------------- [3/3] prefill ----------------
-step "[3/3] Prefill 测试 (SGLang one_batch: ModelRunner.extend$( (( GENERATE )) && echo ' + decode 到真实回复长度'))"
+step "[3/3] Prefill 测试 (SGLang one_batch: ModelRunner.extend$( (( GENERATE )) && echo ' + decode 到真实回复长度'); latent_layer: $LATENT_LIST)"
 {
   echo "host: $(hostname)"
   nvidia-smi --query-gpu=index,name,memory.total,driver_version,power.limit --format=csv,noheader 2>/dev/null || true
@@ -149,10 +150,12 @@ use_yarn=0
 IFS=',' read -ra GPU_ARR <<< "$GPUS"
 IFS=',' read -ra TPS <<< "$TP_LIST"
 IFS=',' read -ra ABS <<< "$ATTENTION_BACKEND_LIST"
+IFS=',' read -ra LATENTS <<< "$LATENT_LIST"
 FAILED=()
 
-for tp in "${TPS[@]}"; do for ab in "${ABS[@]}"; do
+for tp in "${TPS[@]}"; do for ab in "${ABS[@]}"; do for lat in "${LATENTS[@]}"; do
   tag="tp${tp}_attn-${ab}"
+  (( lat >= 0 )) && tag+="_L${lat}"   # latent mode: prefill stops after decoder block lat
   nshards=$(( ${#GPU_ARR[@]} / tp ))
   if (( nshards < 1 )); then warn "skip $tag: needs $tp GPUs (runtime.gpus: $GPUS)"; continue; fi
   rdir="$OUT_DIR/runs/$tag"; mkdir -p "$rdir"
@@ -166,7 +169,8 @@ for tp in "${TPS[@]}"; do for ab in "${ABS[@]}"; do
           --trust-remote-code --port "$((BASE_PORT + 100 * s))"
           --data-prompts "$OUT_DIR/dataset/prompts.jsonl" --data-out-dir "$rdir" --data-shard "$s"
           --data-num-shards "$nshards" --data-batch-tokens "$BATCH_TOKENS" --data-max-requests "$MAX_REQUESTS"
-          --data-generate "$GENERATE" --data-max-new-tokens "$MAX_NEW_TOKENS" --data-default-new-tokens "$DEFAULT_NEW_TOKENS")
+          --data-generate "$GENERATE" --data-max-new-tokens "$MAX_NEW_TOKENS" --data-default-new-tokens "$DEFAULT_NEW_TOKENS"
+          --data-latent-layer "$lat")
     (( use_yarn )) && args+=(--json-model-override-args \
       '{"rope_scaling":{"rope_type":"yarn","factor":4.0,"original_max_position_embeddings":32768}}')
     [[ "$ab" != default ]] && args+=(--attention-backend "$ab")
@@ -190,9 +194,9 @@ for tp in "${TPS[@]}"; do for ab in "${ABS[@]}"; do
   if (( rc )); then
     warn "$tag failed, see $rdir/shard*.log"; tail -n 20 "$rdir"/shard*.log >&2 || true; FAILED+=("$tag")
   fi
-  echo "{\"model\": \"$MODEL\", \"tp\": $tp, \"num_shards\": $nshards, \"attention_backend\": \"$ab\", \"batch_tokens\": $BATCH_TOKENS, \"generate\": $GENERATE}" \
+  echo "{\"model\": \"$MODEL\", \"tp\": $tp, \"num_shards\": $nshards, \"attention_backend\": \"$ab\", \"batch_tokens\": $BATCH_TOKENS, \"generate\": $GENERATE, \"latent_layer\": $lat}" \
     > "$rdir/run.json"
-done; done
+done; done; done
 
 "$PYTHON" "$ROOT/scripts/report.py" --result-dir "$OUT_DIR" --peak-tflops "$PEAK_TFLOPS"
 (( ${#FAILED[@]} )) && warn "failed configs: ${FAILED[*]}"

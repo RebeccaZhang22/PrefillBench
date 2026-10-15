@@ -75,13 +75,16 @@ def load_model_config(model):
         return None
 
 
-def prefill_flops(cfg, L):
-    """Forward FLOPs of prefilling L tokens: dense matmuls + causal attention + last-token lm_head."""
-    h, layers, nh = cfg["hidden_size"], cfg["num_hidden_layers"], cfg["num_attention_heads"]
+def prefill_flops(cfg, L, latent_layer=-1):
+    """Forward FLOPs of prefilling L tokens: dense matmuls + causal attention + last-token lm_head.
+    latent_layer >= 0: only decoder blocks 0..latent_layer, no lm_head."""
+    h, nh = cfg["hidden_size"], cfg["num_attention_heads"]
+    layers = latent_layer + 1 if latent_layer >= 0 else cfg["num_hidden_layers"]
+    head = 0 if latent_layer >= 0 else 2.0 * h * cfg.get("vocab_size", 0)
     nkv, hd = cfg.get("num_key_value_heads", nh), cfg.get("head_dim") or h // nh
     linear = layers * (h * nh * hd + 2 * h * nkv * hd + nh * hd * h + 3 * h * cfg["intermediate_size"])
     L = np.asarray(L, dtype=np.float64)
-    return 2.0 * linear * L + 2.0 * layers * nh * hd * L ** 2 + 2.0 * h * cfg.get("vocab_size", 0)
+    return 2.0 * linear * L + 2.0 * layers * nh * hd * L ** 2 + head
 
 
 def main():
@@ -147,7 +150,8 @@ def main():
                      "tpot": np.array([float(r["tpot_p50_ms"]) if r["tpot_p50_ms"] else np.nan for r in rows])
                      if gen else None}
     for r in runs.values():
-        r["flops"] = np.array([prefill_flops(model_cfg, l).sum() for l in r["lens"]]) if model_cfg else None
+        lat_l = r["meta"].get("latent_layer", -1)
+        r["flops"] = np.array([prefill_flops(model_cfg, l, lat_l).sum() for l in r["lens"]]) if model_cfg else None
 
     out += ["## 纯 prefill 测试结果（SGLang one_batch，`ModelRunner.extend`）", "",
             "每次 `extend()` 调用前后各做一次 device synchronize 计时，不经过 server、HTTP、调度器，也不做 chunked prefill。",
@@ -159,13 +163,18 @@ def main():
             "- **总吞吐 tok/s（全部卡）** = token 总数 ÷ 墙钟时间；",
             "- **MFU（单卡）** = 理论计算量（线性层 + causal attention）÷ extend 总耗时 ÷（单卡峰值 × TP 大小）；",
             "- **墙钟时间**：从第一条请求开始到最后一条结束的实际时间，多卡并行时取整体跨度"
-            "（生成模式下包含 decode 时间）。", ""]
+            "（生成模式下包含 decode 时间）。",
+            "- **计算到的层**：`全部` 为完整模型（含最终 norm、lm_head、采样）；`0..L` 为 latent 模式，配置名带 `_L<L>`，"
+            "prefill 只跑 decoder block 0..L，输出第 L 层的残差流（不做最终 norm / lm_head / 采样），"
+            "MFU 的理论计算量也只算这些层。", ""]
     rows = []
     for tag, r in runs.items():
         tp, ns = r["meta"].get("tp", 1), r["meta"].get("num_shards", 1)
         busy = r["lat"].sum()
         wall = r["end"].max() - r["start"].min()
-        row = {"配置": tag, "GPU 数": tp * ns, "请求数（合计）": f"{sum(len(l) for l in r['lens']):,}",
+        lat_l = r["meta"].get("latent_layer", -1)
+        row = {"配置": tag, "计算到的层": f"0..{lat_l}" if lat_l >= 0 else "全部", "GPU 数": tp * ns,
+               "请求数（合计）": f"{sum(len(l) for l in r['lens']):,}",
                "extend 次数（合计）": f"{len(r['lat']):,}", "token 总数（合计）": f"{r['tokens'].sum():,}",
                "extend 总耗时（合计，GPU·h）": busy / 3600, "每卡 tok/s（单卡）": r["tokens"].sum() / busy / tp,
                "墙钟时间 (h)": wall / 3600}
