@@ -1,159 +1,185 @@
-# PrefillBench：Prefill 效率评测
+# PrefillBench：Prefill 吞吐与延迟测试
 
-用于测量某张推理卡上 **Qwen3-8B-FP8 的纯 prefill 计算效率**。
+使用真实对话和 agent 轨迹，测试 **Qwen3-8B-FP8** 在不同请求长度、并发和 KV cache 条件下的性能。
 
-每条测试请求都是一个完整的对话记录（message list，由 system / user / assistant / tool 消息组成），前面的所有消息都作为上下文。我们只测模型在开始生成 assistant 回复之前，处理这段上下文（prefill）的计算时间。
+使用 **SGLang 0.5.19**，运行入口为 [`run_serve_bench.sh`](run_serve_bench.sh)，配置为 [`shape.yaml`](shape.yaml)。测试经过真实调度器，测量不同并发下的 prefill 吞吐、请求延迟和 KV cache 复用效果。
 
-计时直接使用 SGLang 官方的 `one_batch` 基准工具：对每条请求调用一次 `ModelRunner.extend()`，前后各做一次 GPU 同步。这样**测到的只是 prefill 计算本身，不包含 server、HTTP、调度器、chunked prefill 等部署层面的开销**。
+| 角色 | GPU | 状态 |
+|---|---|---|
+| 参考基线 | 1 × H20（141 GB） | 已完成：[2026-10-15 报告](reports/h20_latent_l23_request_shapes_2026-10-15.pdf) |
 
-## 一条命令运行
+## 快速开始
 
-先按 [`data/README.md`](data/README.md) 下载原始数据，然后执行：
+### 1. 准备机器和 Python 环境
 
-```bash
-bash run_pipeline.sh            # 读取 ./config.yaml
-```
+- 使用 Python 3.11，先确认 NVIDIA 驱动和 CUDA 环境能够识别目标卡。
+- 测试使用 SGLang 0.5.19。已有 H20 参考环境为 `torch 2.13.0+cu130`、驱动 `580.82.07`；目标机器的驱动需满足其 GPU 和 CUDA 环境的要求。
+- 访问 GitHub、Python 包源和 Hugging Face。环境安装问题可参考 [SGLang 官方安装说明](https://docs.sglang.io/docs/get-started/install)，本测试固定使用 **0.5.19**。
 
-所有参数都写在 [`config.yaml`](config.yaml) 里，包括数据路径、下采样规则、使用哪个 python、哪几张 GPU 等。要用其他配置文件时，把路径传进去即可：`bash run_pipeline.sh my.yaml`。
-
-另有两个可选开关，会覆盖 yaml 中对应的设置：
-
-- `--stats-only`：只做数据处理和可视化，不跑测试；
-- `--yes`：看完数据分布后不询问，直接开始测试。
-
-## 流程图
-
-```mermaid
-flowchart TD
-    D0["data/README.md<br/>hf download 两个原始数据集（固定 revision）"] --> A1[("data/WildChat-1M<br/>parquet，837,989 行")]
-    D0 --> A2[("data/SWE-rebench-openhands-trajectories<br/>parquet，67,074 行")]
-
-    Y[/"config.yaml<br/>sampling: 每个 source 的 input / 下采样规则 / seed<br/>runtime: python、GPU、TP、显存 ...<br/>pipeline: confirm、stats_only"/] --> R
-    A1 --> R["bash run_pipeline.sh"]
-    A2 --> R
-
-    R --> S0["读取并校验 config.yaml<br/>检查依赖、sglang==0.5.21、GPU"]
-    S0 --> S1["[1/3] 数据处理 + 下采样 prepare_data.py<br/>每行原始数据 → 完整 message list（在最后一次 assistant 输出前截断）<br/>→ chat template 统计 token 数（缓存）→ 按 seed 下采样"]
-    S1 --> O[("data/processed/<br/>wildchat.jsonl<br/>swe_rebench.jsonl<br/>manifest.json（指纹）")]
-    O --> S2["[2/3] 可视化 visualize.py<br/>终端统计表 + sample_distribution.png<br/>左：token 分布　右：轮次分布"]
-    S2 --> Q{"stats_only?"}
-    Q -- 是 --> END1(["结束：只看数据分布"])
-    Q -- 否 --> K{"confirm?<br/>测试者确认 y/N"}
-    K -- N --> END2(["放弃"])
-    K -- y --> S3a["[3/3] make_prompts.py<br/>套 chat template（含 tools）分词<br/>→ prompts.jsonl + prompts_ids.bin"]
-    S3a --> S3b["prefill_one_batch.py × N 个分片<br/>（GPU 按 TP 分组，每组处理 1/N 数据）<br/>SGLang 官方 one_batch：逐条 ModelRunner.extend()<br/>前后 synchronize 计时<br/>（可选：接着 decode 到真实回复长度）"]
-    S3b --> L{"tp × attention_backend<br/>还有下一组配置?"}
-    L -- 有 --> S3b
-    L -- 无 --> S4["report.py<br/>→ results/&lt;时间戳&gt;/report.md + figs/"]
-```
-
-## 运行流程
-
-### 0. 准备环境和数据（测试者只需做一次）
+执行以下命令：
 
 ```bash
-pip install sglang==0.5.21 pyyaml pyarrow matplotlib
+nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv
+
+git clone https://github.com/RebeccaZhang22/PrefillBench.git
+cd PrefillBench
+
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install "sglang==0.5.19" pyyaml pyarrow matplotlib huggingface_hub
+
+python - <<'PY'
+import sglang
+import torch
+
+print("SGLang:", sglang.__version__)
+print("PyTorch:", torch.__version__, "CUDA:", torch.version.cuda)
+assert sglang.__version__ == "0.5.19", "本测试使用 SGLang 0.5.19"
+assert torch.cuda.is_available(), "当前 Python 环境无法使用 CUDA，请先检查驱动和安装环境"
+print("CUDA 可用，GPU 数量:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    gpu = torch.cuda.get_device_properties(i)
+    print(f"GPU {i}: {gpu.name}, 显存 {gpu.total_memory / 1024**3:.1f} GiB")
+PY
 ```
 
-然后按 [`data/README.md`](data/README.md) 下载两个原始数据集，放到 `data/` 目录下，一共约 5.2 GB。
+先进入仓库并执行 `source .venv/bin/activate`。
 
-最后检查 `config.yaml` 的 `runtime` 一节，至少确认 `python`（装了上面这些包的那个 python）、`model`、`gpus` 三项。如果要计算 MFU，还需要填写 `peak_tflops`。
+### 2. 下载固定版本的数据和模型
 
-### 1. 读取配置并检查
+在仓库根目录执行：
 
-[`scripts/load_config.py`](scripts/load_config.py) 会读取并校验 yaml，以下错误会直接报错退出：
+```bash
+hf download allenai/WildChat-1M --repo-type dataset \
+  --revision 7d6490e462285cf85d91eabea0f9a954fbddcd1f \
+  --local-dir data/WildChat-1M
 
-- 缺少必填字段；
-- source 的 `format` 不是支持的格式；
-- `max_input_tokens` 没有小于 `context_length`；
-- 长度分段不是递增的。
+hf download nebius/SWE-rebench-openhands-trajectories --repo-type dataset \
+  --revision 35455389ab51bf5e2306bfd436ef72d0f98bf882 \
+  --local-dir data/SWE-rebench-openhands-trajectories
 
-接着检查 `runtime.python` 能否导入所需的包、sglang 版本是否为 0.5.21、配置里的 GPU 编号是否存在。
-
-本次使用的 `config.yaml` 会复制一份到结果目录，方便日后复现。
-
-### 2. [1/3] 数据处理 + 下采样
-
-[`scripts/prepare_data.py`](scripts/prepare_data.py) 对每个 source 依次做以下处理：
-
-1. **转换**：每行原始数据转成一条 prefill 请求，也就是一个完整的 message list，在最后一次 assistant 输出之前截断，所以最后一条消息一定是 user 或 tool。
-   - WildChat：每个对话一行。
-   - SWE-rebench：每条 agent 轨迹一行，同时带上 `tools`（工具的 JSON schema）。
-2. **统计长度**：用 Qwen3 的 chat template（`add_generation_prompt=True`、`enable_thinking=False`）计算每条请求的 prefill token 数。这一步耗时最长，单机约 10 分钟。结果会缓存在 `data/processed/.index/`，只要原始数据和 tokenizer 不变，之后换 seed 或换规则重新采样只需要几秒。
-3. **下采样**：每个 source 单独执行，随机数生成器为 `numpy.random.default_rng([seed, crc32(source 名)])`：
-   1. 丢掉 token 数小于 `min_tokens` 或大于 `max_input_tokens` 的行；
-   2. token 数小于 `short_len` 的短请求，只按 `short_keep` 的比例随机保留；
-   3. 在剩下的行中不放回地均匀抽 `num_samples` 条；如果不够，就全部保留。
-4. **输出**：每个 source 生成一个 jsonl 文件，即 `data/processed/wildchat.jsonl` 和 `data/processed/swe_rebench.jsonl`。
-
-**相同的原始数据、相同的规则，输出的文件逐字节一致。** `manifest.json` 里记录了被选中样本 id 的 sha256 指纹，不同的人可以用它核对抽到的是不是同一批数据。如果规则和原始数据都没有变化，这一步会被直接跳过。
-
-输出 jsonl 的每一行格式如下，开头几个字段的顺序固定：
-
-```json
-{"id": "swe_rebench-chatcmpl-...", "source": "swe_rebench", "num_tokens": 46466, "num_turns": 45, "num_messages": 90,
- "num_output_tokens": 212,
- "meta": {"instance_id": "...", "repo": "...", "resolved": 1},
- "tools": [{"function": {"name": "execute_bash", "parameters": {...}}}],
- "messages": [{"role": "system", "content": "..."}, {"role": "user", "content": "..."},
-              {"role": "assistant", "content": "...", "tool_calls": [...]},
-              {"role": "tool", "content": "...", "tool_call_id": "..."}]}
+# 提前将模型下载到 Hugging Face 缓存；测试时会自动使用
+hf download Qwen/Qwen3-8B-FP8
 ```
 
-- `num_tokens`：prefill 的 token 数。
-- `num_turns`：上下文中 assistant 消息的条数加 1，也就是当前正在 prefill 的是第几轮。
-- `num_output_tokens`：被截掉的那条 assistant 回复的 token 数，即这条请求在真实数据里的回复长度（WildChat 是原始回答，SWE 是 agent 的下一步，含 tool call）。只在完整生成测试中用作生成长度。
+数据目录结构见 [`data/README.md`](data/README.md)。
 
-### 3. [2/3] 可视化
+### 3. 选择目标 GPU
 
-[`scripts/visualize.py`](scripts/visualize.py) 会在终端打印统计表，内容包括：
+打开 [`shape.yaml`](shape.yaml)，默认使用 GPU 0：
 
-- 每个 source 的请求数、token 总数，token 长度的均值 / p50 / p90 / p99 / 最大值，以及轮次统计；
-- 各长度区间的请求数，以及这些请求在总请求数、总 token 数中的占比。
+```yaml
+runtime:
+  python: python3
+  sglang_version: "0.5.19"
+  model: Qwen/Qwen3-8B-FP8
+  gpus: [0]
+  context_length: 81920
+```
 
-同时保存一张图 `dataset/sample_distribution.png`：**左图是 token 分布，右图是轮次分布**，不同 source 用不同颜色区分。
+从 `nvidia-smi` 输出中找到目标 GPU。如果它是 GPU 3，只把 `gpus: [0]` 改为 `gpus: [3]`；只有一张卡时通常保持 `[0]`。这个入口只使用列表中的第一张卡，保持单卡测试即可。已激活 `.venv` 时，`python3` 就是该环境里的 Python。
 
-如果 `pipeline.confirm` 为 `true`，测试者看完统计结果后需要输入 `y`，才会进入测试。
+其余参数先保持原样：`serve.latent_layer: 23` 表示只计算 block 0..23，共 24 层；保持数据、层数和上下文长度一致，便于比较不同 GPU 的结果。若数据或模型已放在其他目录，可修改 `sampling.sources[].input`、`runtime.model`；离线使用时还需将 `sampling.tokenizer` 指向同一模型目录。
 
-### 4. [3/3] 纯 prefill 测试
+### 4. 先做单并发试跑
 
-1. **分词**：[`scripts/make_prompts.py`](scripts/make_prompts.py) 把两个 jsonl 里的 `messages`（以及 `tools`）套上 chat template 并分词，结果写入 `prompts.jsonl` 和 `prompts_ids.bin`。
-2. **计时**：[`scripts/prefill_one_batch.py`](scripts/prefill_one_batch.py) 基于 SGLang 官方的 `sglang.benchmark.one_batch`（[官方文档](https://github.com/sgl-project/sglang/blob/main/docs/docs/developer_guide/benchmark_and_profiling.mdx)），只替换了其中的 `load_model` 一个函数（latent 模式下还会包一层 `ModelRunner.init_cuda_graphs`，见下面第 6 点），其余逻辑都是官方原样。
-   - 每个 rank 加载完模型后，逐条执行官方的 `extend()`，前后各调用一次 device synchronize 计时；
-   - 跑完我们的数据后，再交回官方流程收尾。
-3. **多卡**：GPU 按 `tp` 分组，每组独立处理一部分数据，相当于数据并行。例如 4 张卡、`tp: [1]` 时，会起 4 个进程，每个进程处理 1/4 的数据。如果 `tp` 或 `attention_backend` 写了多个值，会对每种组合各跑一遍。
-4. **监控**：测试期间用 nvidia-smi 记录 GPU 利用率和功耗。
-5. **完整生成测试（可选）**：把 `runtime.generation.enabled` 设为 `true` 后，每条请求 prefill 完会接着用官方的 `decode()` 逐个 token 生成，生成长度取数据中真实回复的长度（`num_output_tokens`，上限 `max_new_tokens`，且保证输入 + 输出不超过上下文长度），中途不因 EOS 停止，所以每次测试的生成长度完全一致。每一步 decode 前后都做 device synchronize，得到 **TTFT**（prefill 时间）、**TPOT**（每个输出 token 的时间）和 **端到端延迟**（TTFT + 全部 decode 时间）。这是单请求（batch size 1）的延迟测试，不代表服务端合批后的吞吐。
-6. **中间层 latent 测试（可选）**：如果只需要模型中间某一层的 latent（隐层表示），不需要后面的层，可以把 `runtime.latent_layer` 设为 decoder block 编号 L（从 0 开始；Qwen3-8B 共 36 层，即 0..35）。这样测到的是"只算到第 L 层"的 prefill 延迟和吞吐：
-   - **做法**：在 CUDA graph 捕获**之前**，对已经加载的模型做运行时替换（不改 SGLang 安装目录下的文件）：decoder 循环只跑 block 0..L，最终 RMSNorm 换成"只把 hidden 和 residual 相加"，`logits_processor` 换成"取每条请求最后一个 token 的 latent"，`sample` 换成空操作。所以计时范围是 embedding、block 0..L，以及取出最后一个 token 第 L 层残差流 `[请求数, hidden]`，**不含最终 norm、lm_head 和采样**。
-   - **latent 的含义**：第 L 个 block 的输出残差流（`hidden_states + residual`，未做 norm），和 CoolWatch featurizer、activation-capture 中的 `layer=L` / `block_output` 是同一个位置。latent 留在 GPU 上，不拷回 CPU、也不落盘。
-   - **扫参**：可以写多个值，例如 `latent_layer: [full, 8, 17, 26]`，每个值单独跑一遍，配置名带 `_L<L>` 后缀；`full` 就是原来的完整模型。报告里的 MFU 只按实际算了的层计算（不含 lm_head）。
-   - **校验**：每次 extend 都会检查输出形状是否为 `[请求数, hidden]`；如果实际跑的是完整模型（例如某个 CUDA graph 是在截断前捕获的），会直接报错，不会悄悄测错。
-   - **限制**：不能和 `generation.enabled` 同时开（没有 lm_head 就无法生成）；不支持 PP；只在 Qwen2/Qwen3 结构的模型上实现。KV 池仍然按全部层分配，这不影响计时。TP>1 没有验证过。
+下面的命令从正式配置生成 `shape_smoke.yaml`：四种请求形状都只测并发 1、prefill size 4096，缩短测量时间，先确认流程能走通。
 
-### 5. 报告
+```bash
+python - <<'PY'
+import yaml
 
-[`scripts/report.py`](scripts/report.py) 生成 `report.md`，内容包括：
+with open("shape.yaml") as f:
+    cfg = yaml.safe_load(f)
 
-- 本次使用的配置和运行环境；
-- 数据分布；
-- 每组配置的总 token 数、纯计算时间、**tok/s/GPU** 和 **MFU**；
-- 按长度分桶统计的延迟（p50 / p90）、吞吐和 MFU；
-- 延迟、吞吐、MFU 随输入长度变化的散点图，以及 GPU 利用率曲线；
-- 开启完整生成测试时，另有 TTFT / TPOT / 端到端延迟 / decode 占比的总表、按输入长度分段的表和对应的图。
+cfg["serve"]["prefill_sizes"] = [4096]
+cfg["serve"]["shapes"] = {name: [1] for name in cfg["serve"]["shapes"]}
+cfg["serve"]["level_min_seconds"] = 10
+cfg["serve"]["level_min_requests_per_conc"] = 1
+cfg["serve"]["level_max_seconds"] = 60
 
-报告里数量类指标（请求数、token 数、耗时）是所有卡的合计，效率类指标（每卡 tok/s、延迟、MFU）是单卡口径，列名中都有标注。图都使用线性坐标：上排为完整长度范围，下排放大 0–16k。
+with open("shape_smoke.yaml", "w") as f:
+    yaml.safe_dump(cfg, f, sort_keys=False)
+PY
 
-## 请求形状 × 并发测试（真实调度器）
+bash run_serve_bench.sh shape_smoke.yaml
+```
 
-上面的 one_batch 测试绕过了调度器，测不了"打满并发""复用 KV cache""chunked prefill 设多大""给定延迟最多支持多少并发"这类问题。这些由 [`run_serve_bench.sh`](run_serve_bench.sh) + [`scripts/serve_bench.py`](scripts/serve_bench.py) 负责，配置在 [`shape.yaml`](shape.yaml)：
+首次仍需对原始数据统计长度、抽样和分词，并加载模型、编译 kernel、预热。`level_max_seconds` 是每档停止发新请求的上限。
+
+成功时，终端最后会打印 `done. report: .../serve_report.md`。正式测试会复用已经处理好的数据。
+
+### 5. 运行完整基准
+
+```bash
+bash run_serve_bench.sh shape.yaml
+```
+
+默认测试 4 种请求形状、2 档 prefill size，共 54 个并发测试档位。H20 基线在 2026-10-15 17:21–20:49 跑完，约 **3 小时 28 分钟**；目标 GPU 的耗时以实测为准，首次下载和数据处理还需要额外时间。通过 SSH 运行时，建议放在 `tmux` 等可保持运行的终端会话里。
+
+只想先测部分组合，可以执行：
+
+```bash
+bash run_serve_bench.sh shape.yaml --shapes short --prefill-sizes 4096
+```
+
+这仍会跑 `short` 的全部 9 个并发档位，也仍会准备两份数据、预热短请求和长请求；要做单并发试跑，请使用第 4 步的配置。
+
+### 6. 查看并回传结果
+
+每次运行使用独立的 `results/shape_<时间戳>/` 目录：
+
+```text
+results/shape_<时间戳>/
+  serve_report.md                   吞吐、延迟、满足 SLO 的最大并发
+  summary.jsonl                     每个测试档位一行的机器可读结果
+  config.yaml  sampling_config.json 本次配置
+  env.txt  serve.log                GPU、软件版本和完整运行日志
+  ps4096/  psdefault/               各形状、各并发的逐请求 CSV
+  figs/serve.png                    吞吐和延迟曲线
+```
+
+### 7. 怎样比较不同 GPU 的结果
+
+已有参考基线见 [H20 请求形状 × 并发报告](reports/h20_latent_l23_request_shapes_2026-10-15.pdf)，其运行标识为 `shape_20261015_172145`。固定 prefill size 4096 的几个参照点如下：
+
+| 请求形状 | 并发 | H20 计算 tok/s | H20 服务 tok/s | H20 p90 延迟 |
+|---|---|---|---|---|
+| `short`（约 4k） | 1 | 19,549 | 19,549 | 0.22 s |
+| `short`（约 4k） | 128 | 23,402 | 23,402 | 24.4 s |
+| `long`（约 64k） | 1 | 7,387 | 7,387 | 9.2 s |
+| `long`（约 64k） | 32 | 8,370 | 8,370 | 291 s |
+| `long_seg_cache`（每段） | 16 条轨迹 | 7,775 | 20,209 | 48 s |
+
+- 对齐**请求形状、并发、prefill size、模型层数和软件版本**后比较。吞吐倍率 = 目标 GPU tok/s ÷ 参考 GPU tok/s；延迟越低越好。
+- 优先比较固定 `4096` 那组。`default` 由 SGLang 按显存等条件选择，H20 上是 chunk 8192、`max_prefill_tokens` 16384，不同 GPU 不保证相同。
+- 缓存测试同时看**服务 tok/s、缓存命中率和 KV 容量**。H20 基线显存为 141 GB，KV 池容量为 1,067,688 token；目标 GPU 的显存以 `nvidia-smi` 输出为准，KV 容量以引擎实际分配为准。缓存逐出的时机可能不同，服务吞吐差异包含显存容量的影响。
+- H20 基线使用 DeepGEMM。目标 GPU 的实际 FP8 / attention 后端应记录在结果说明中；如果因硬件兼容性调整了后端或软件版本，比较时一并注明。
+- 固定模型 `Qwen/Qwen3-8B-FP8`、`latent_layer: 23`、上下文长度 81920、采样规则、正式测试时长和并发档位。若为了适配硬件修改了这些设置，回传时注明，结果应单独比较。
+- 低并发长请求的样本较少，p90 只作粗略参考；本测试不包含 HTTP 或输入分词时间，也不测多 token decode 性能。
+
+## 常见问题
+
+| 现象 | 处理方式 |
+|---|---|
+| 数据处理占用太多 CPU / 主机内存 | 将 `processing.workers: 0`（所有 CPU）改为较小的进程数，例如 8。 |
+| 启动时长时间没有新输出 | 首次 kernel 编译和模型加载可能较慢；查看当前结果目录的 `serve.log`，终端只显示筛选后的进度行。 |
+| 运行退出，但终端没有报错详情 | 查看本次结果目录的 `serve.log`；完整异常写在这里。 |
+| CUDA / FP8 kernel 不支持，或显存不足 | 先确认该卡对当前 SGLang 和 FP8 模型的支持；提供 GPU 型号、显存及 `serve.log`。显存不足还需区分激活空间与 KV 池容量，改动参数后应注明。 |
+
+## 请求形状测试的原理
+
+下面是快速开始所运行测试的详细口径。
+
+请求形状测试测量真实调度器下的吞吐与延迟，包括并发、KV cache 复用和 chunked prefill 的影响，由 [`run_serve_bench.sh`](run_serve_bench.sh) + [`scripts/serve_bench.py`](scripts/serve_bench.py) 负责，配置在 [`shape.yaml`](shape.yaml)：
 
 ```bash
 bash run_serve_bench.sh                                   # 默认 shape.yaml
 bash run_serve_bench.sh shape.yaml --shapes short --prefill-sizes 4096   # 只跑一部分
 ```
 
-- **数据**：WildChat 中 3.5k–4.5k token 的对话 1 万条（短），SWE 轨迹中 56k–72k token 的 1 万条（长）。用的是同一套 `prepare_data.py`，只是每个 source 多了一个 `max_tokens` 长度上限；长度索引直接复用 `data/processed/.index` 的缓存。这 1 万条只作样本池：每个并发档位跑到稳态就停，不会把 1 万条全跑完（全跑完 64k 那批单卡要 20 小时左右）。
+- **数据**：WildChat 中 3.5k–4.5k token 的对话 1 万条（短），SWE 轨迹中 56k–72k token 的 1 万条（长）。`prepare_data.py` 将原始记录转换为完整消息列表，在最后一次 assistant 回复之前截断，用模型的 chat template 计算 token 长度，再按固定 seed 和长度范围抽样。输出在 `data/processed_shape/`，长度索引保存在其中的 `.index/`，重复运行会复用。两批数据只作样本池，每个并发档位达到测量条件后停止发新请求，不会把每批 1 万条全跑完。
 - **服务端**：进程内 SGLang Engine（真实调度器、continuous batching、chunked prefill、radix cache），直接传 token ids，`max_new_tokens=1`，所以 prefill 完就结束，没有 decode。`serve.latent_layer: 23` 表示只跑 decoder block 0..23（36 层的 2/3），模型按 24 层构建（`num_hidden_layers` 覆盖），权重和 KV 池也只按 24 层分配；final norm、lm_head 用 [`latent_exit.py`](scripts/latent_exit.py) 去掉，采样器只拿到一个全零 logits。
 - **四种请求形状**：
   - `short`：独立的 ~4k 请求（radix cache 关）；
@@ -161,90 +187,6 @@ bash run_serve_bench.sh shape.yaml --shapes short --prefill-sizes 4096   # 只�
   - `long_seg_cache`：一条长轨迹在最接近 1/4、2/4、3/4 长度的 assistant 轮次边界切开，变成 4 个累积前缀请求（约 16k / 32k / 48k / 64k），按顺序发送。radix cache 开，所以后一段会复用前一段的 KV（前提是还没被逐出）；
   - `long_seg_nocache`：同样的 4 段请求，但 radix cache 关，相当于前面轮次的 KV 已经被逐出，每一段都要把整个前缀重算一遍。
 - **prefill size**：`serve.prefill_sizes: [4096, default]`。整数表示同时设 `chunked_prefill_size` 和 `max_prefill_tokens`，即一次前向最多处理多少 token；`default` 表示不设，由 SGLang 按显存自动选（H20：chunk 8192，max_prefill_tokens 16384）。
-- **并发**：闭环，始终有 C 个请求（分段形状里是 C 条轨迹）在途。每档至少跑 60 秒，并且至少完成 4×C 个请求，才停止发新请求。统计窗口从开始发请求到停止发请求为止，跨越窗口边界的请求按重叠比例计入。
+- **并发**：闭环，始终有 C 个请求（分段形状里是 C 条轨迹）在途。每档至少跑 60 秒，并且至少完成 4×C 个请求后停止发新请求；若先达到 900 秒上限，也会停止发新请求，然后等待在途请求完成。统计窗口从开始发请求到停止发请求为止，跨越窗口边界的请求按重叠比例计入。
 - **指标**：计算 tok/s（输入 token 减去缓存命中，即 GPU 实际 prefill 的量）、服务 tok/s（全部输入 token）、每个请求的延迟 p50/p90/p99（客户端从提交到完成，含排队）。报告 `serve_report.md` 会列出每种形状、每个 prefill size 在各个延迟要求下（`serve.slo_seconds`，按 p90）能支持的最大并发。
-- **注意**：SGLang 第一次启动时会给 DeepGEMM（FP8 矩阵乘法）做 JIT 预编译，范围是 M ≤ 2 × chunk（chunk ≤ 8192 时 M ≤ 16384，上限 131072），结果缓存在 `~/.cache/sglang`。chunk 设得很大（比如 256k）时，第一次编译要几个小时。
-
-## config.yaml 主要参数
-
-| 位置 | 参数 | 默认值 | 说明 |
-|---|---|---|---|
-| `paths` | `processed_dir` | `data/processed` | 第 1 步的输出目录，存放两个 jsonl 和 manifest |
-| | `out_dir` | `auto` | 可视化和测试结果的目录；`auto` 表示 `results/<时间戳>` |
-| `processing` | `workers` | 0 | 第 1 步统计 token 数用的进程数；0 表示使用全部 CPU |
-| `sampling` | `seed` | 20261013 | 下采样随机种子 |
-| | `max_input_tokens` | 131000 | 请求长度上限，必须小于 `context_length` |
-| | `sources[].format` / `input` | — | 原始数据格式（`wildchat` 或 `swe_rebench`）和 parquet 所在目录 |
-| | `sources[].num_samples` | wildchat 90000 / swe 10000 | 每个 source 抽取的请求数 |
-| | `sources[].short_len` / `short_keep` | wildchat 512 / 0.1 | 短 query 下采样规则：短于 `short_len` 的请求只保留 `short_keep` 比例 |
-| `runtime` | `python` | `python3` | 装有 sglang==0.5.21 的 python 路径 |
-| | `model` | `Qwen/Qwen3-8B-FP8` | 模型路径或 HF id |
-| | `gpus` / `tp` | `[0]` / `[1]` | 使用的 GPU 编号和 TP 大小；`tp` 写多个值即扫参 |
-| | `attention_backend` | `[default]` | attention backend，写多个值即扫参 |
-| | `mem_fraction_static` | 0.7 | KV 池占用的显存比例。出现 OOM 时调小；日志出现 `skip ... > KV capacity` 时调大 |
-| | `context_length` / `yarn` | 131072 / auto | 上下文长度；超过 40k 时自动开启 YaRN，并设置 `SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN=1`（否则 SGLang 会拒绝超过 40,960 的上下文） |
-| | `batch_tokens` | 0 | 0 表示每条请求单独 prefill；大于 0 时，把多条请求拼进一次 `extend()`，总长度不超过这个值 |
-| | `max_requests` | 0 | 每个分片最多跑多少条，0 表示不限。会在分片内均匀抽取，并一定包含最长的请求，所以小规模就能覆盖各种长度 |
-| | `extra_server_args` | `""` | 其他 SGLang 参数，例如 `--fp8-gemm-backend cutlass` |
-| | `peak_tflops` | 0 | 单卡峰值算力，用于计算 MFU；0 表示不计算 |
-| | `latent_layer` | `[full]` | prefill 算到哪一层：`full` = 完整模型；整数 L = 只跑 decoder block 0..L，输出第 L 层 latent；写多个值则扫参 |
-| | `generation.enabled` | false | 是否做完整生成测试（prefill 后接 decode） |
-| | `generation.max_new_tokens` / `default_new_tokens` | 2048 / 256 | 生成长度上限；没有参考回复时使用的生成长度 |
-| `pipeline` | `confirm` / `stats_only` | true / false | 测试前是否需要确认；是否只做数据处理和可视化 |
-
-## 示例报告
-
-[`reports/h20_prefill_generation_2026-10-14.pdf`](reports/h20_prefill_generation_2026-10-14.pdf)：在 2 张 H20 上跑 2,002 条请求（每张卡从 10 万条下采样数据中均匀抽 1,000 条，另含最长的一条），同时包含纯 prefill 和完整生成两部分结果。注意这次用的是本地打过补丁的 sglang 0.5.19（`allow_version_mismatch: true`），不是固定的 0.5.21。主要结果（单卡）：
-
-| 输入长度 | prefill 每卡 tok/s | MFU（FP8 峰值 296 TFLOPS） | TTFT p50 | TPOT p50 | 端到端 p50（真实回复长度） |
-|---|---|---|---|---|---|
-| 512 – 1k | 13,756 | 66% | 52 ms | 6.1 ms | 2.6 s |
-| 2k – 4k | 13,420 | 67% | 214 ms | 6.3 ms | 2.4 s |
-| 8k – 16k | 11,222 | 67% | 1.0 s | 7.1 ms | 5.2 s |
-| 32k – 64k | 5,959 | 58% | 8.3 s | 10.3 ms | 14.5 s |
-| 64k – 128k | 4,212 | 55% | 15.6 s | 12.2 ms | 23.8 s |
-
-[`reports/h20_latent_l23_request_shapes_2026-10-15.pdf`](reports/h20_latent_l23_request_shapes_2026-10-15.pdf)：`run_serve_bench.sh` + `shape.yaml` 在 1 张 H20 上的结果，只算到第 23 层（36 层的 2/3），比较 4k / 64k / 64k 分 4 段（复用与不复用 KV cache）在不同并发下的吞吐和延迟，以及 prefill size 4k 与默认值的差别。用的是官方 sglang 0.5.19 wheel（未打补丁）。主要结论：
-
-- 单个请求就基本把 GPU 占满：并发 1 时吞吐已达打满时的 84–88%（4k 请求约 23.4k tok/s，64k 请求约 8.5k tok/s），再加并发只是排队，延迟和并发数成正比；
-- prefill size 4k 和默认值（chunk 8192）的吞吐只差 0.3–2%；
-- 给定延迟下的最大并发 ≈ 延迟要求 × 吞吐 ÷ 每个请求的 token 数（4k 请求 p90 ≤ 1 s 约 4 个并发，64k 请求 p90 ≤ 60 s 约 4 个）；
-- 分段复用 KV cache 时服务的 token 数翻倍，但在途轨迹的 KV 总量超过 KV 池后，缓存被逐出，优势消失。
-
-## 目录与输出
-
-```
-data/
-  README.md                         数据下载说明
-  WildChat-1M/  SWE-rebench-openhands-trajectories/      原始数据（自行下载，不在 git 中）
-  processed/                        第 1 步的输出
-    wildchat.jsonl  swe_rebench.jsonl   下采样后的请求，每个 source 一个文件
-    manifest.json  sample_index.csv     规则、计数、指纹，以及每条请求的长度和轮次
-    .index/                             token 长度缓存
-results/<时间戳>/
-  config.yaml  sampling_config.json  env.txt
-  dataset/      sample_manifest.json, sample_index.csv, sample_stats.json, sample_distribution.png,
-                prompts.jsonl, prompts_ids.bin
-  runs/<tp*_attn-*>/   batches_shard*.csv（每次 extend() 一行：tokens、latency_s、起止时间、ids）,
-                       summary_shard*.json, shard*.log, cmd_shard*.txt, gpu_monitor.csv
-  report.md  figs/
-```
-
-## 版本与依赖
-
-- **SGLang 固定为 0.5.21**，它会同时锁定 `torch==2.13.0` 和 `transformers==5.12.1`。固定版本有两个原因：
-  - 不同版本的 kernel 和默认 backend 不同，测出的结果不可比；
-  - 第 3 步依赖官方 `one_batch` 模块内部的函数。
-
-  因此 sglang 版本不一致时，流程会直接报错退出。确实需要使用其他版本时，可以设置 `runtime.allow_version_mismatch: true`，此时只打印警告。
-- `prefill_one_batch.py` 已对照 0.5.21 的官方源码核对过，依赖以下接口：`load_model`、`prepare_synthetic_inputs_for_latency_test`、`_TorchBenchRunner` 的 `clear` / `extend` / `synchronize`、`main`、`BenchArgs`。
-- 其他依赖：
-  - Python 包：`pyyaml`（读取配置）、`pyarrow`（读取 parquet）、`numpy`、`matplotlib`；
-  - 系统工具：`nvidia-smi`、`setsid`。
-- 读取 yaml 时默认使用 PATH 中的 `python3`，可以用环境变量 `GPUBENCH_PYTHON` 指定其他 python；后续所有步骤都用 `runtime.python` 执行。
-
-## 注意事项
-
-- **耗时**：默认配置共 10 万条请求、约 7.1 亿 token。其中 SWE 只有 1 万条，却贡献了约 77% 的 token，而且上下文很长，attention 计算量大。按 FLOPs 粗估，单卡纯计算需要 14–37 小时。想先快速看趋势，可以调小 `num_samples`，或者设置 `max_requests`。
-- **显存**：测试不做 chunked prefill，一条 128k 的请求会在一次前向中完成，激活值占用的显存较多。因此 `mem_fraction_static` 默认只设为 0.7，为激活值留出空间。建议先设 `max_requests: 50` 试跑一下。
-- **长度分布**：WildChat 的请求集中在 0.5k–4k token，SWE 集中在 32k–128k，8k–32k 之间的样本很少。
+- **首次启动**：模型加载、kernel 编译和预热会增加准备时间，具体取决于 GPU 和实际使用的后端。H20 基线使用 DeepGEMM，并缓存了编译结果；目标 GPU 首次运行的准备时间应单独观察。

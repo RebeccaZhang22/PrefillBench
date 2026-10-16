@@ -19,7 +19,7 @@ data/SWE-rebench-openhands-trajectories/trajectories.parquet  67,074 行
 ```
 
 - 老版本的 `huggingface_hub` 没有 `hf` 命令，可以把 `hf download` 换成 `huggingface-cli download`，参数一样。
-- 如果数据放在别的位置，请修改 `config.yaml` 里各个 source 的 `input` 路径。
+- 如果数据放在别的位置，请修改 `shape.yaml` 的 `sampling.sources` 中各个 source 的 `input` 路径。
 - 两个数据集的许可证：WildChat-1M 为 ODC-BY，SWE-rebench-openhands-trajectories 为 CC-BY-4.0。
 
-下载好以后，运行 `bash run_pipeline.sh`。第 1 步会把原始数据处理并下采样，在 `data/processed/` 下生成 `wildchat.jsonl` 和 `swe_rebench.jsonl`。
+下载好以后，按[仓库 README](../README.md)选择目标 GPU 并完成试跑，然后运行 `bash run_serve_bench.sh shape.yaml`。脚本会处理原始数据并下采样，在 `data/processed_shape/` 下生成 `wildchat.jsonl` 和 `swe_rebench.jsonl`，随后分词并运行请求形状与并发测试。
