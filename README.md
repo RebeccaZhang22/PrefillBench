@@ -6,7 +6,7 @@
 
 | 角色 | GPU | 状态 |
 |---|---|---|
-| 参考基线 | 1 × H20（141 GB） | 已完成：[2026-10-15 报告](reports/h20_latent_l23_request_shapes_2026-10-15.pdf) |
+| 参考基线 | 1 × H20（141 GB） | 已完成：[2026-10-15 报告](reports/h20_prefill_request_shapes_2026-10-15.pdf) |
 
 ## 快速开始
 
@@ -142,7 +142,7 @@ results/shape_<时间戳>/
 
 ### 7. 怎样比较不同 GPU 的结果
 
-已有参考基线见 [H20 请求形状 × 并发报告](reports/h20_latent_l23_request_shapes_2026-10-15.pdf)，其运行标识为 `shape_20261015_172145`。固定 prefill size 4096 的几个参照点如下：
+已有参考基线见 [H20 请求形状 × 并发报告](reports/h20_prefill_request_shapes_2026-10-15.pdf)，其运行标识为 `shape_20261015_172145`。固定 prefill size 4096 的几个参照点如下：
 
 | 请求形状 | 并发 | H20 计算 tok/s | H20 服务 tok/s | H20 p90 延迟 |
 |---|---|---|---|---|
